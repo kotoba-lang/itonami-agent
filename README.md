@@ -143,6 +143,18 @@ launchctl kickstart -k gui/$(id -u)/cloud.itonami.agent.gateway   # restart
 launchctl bootout gui/$(id -u)/cloud.itonami.agent.gateway         # stop
 ```
 
+## Fleet deployment
+
+A node needs only `node`: the runtime is the nbb engine (`cli.js`, `lib/`,
+`node_modules/import-meta-resolve`, ~19 MB) plus this repository, placed in
+`~/.itonami/runtime/`. On the murakumo mishima nodes it runs as
+`/Library/LaunchDaemons/cloud.itonami.agent.peer.plist` (`UserName` = the
+node user, like `com.murakumo.mishima`), `node cli.js bin/itonami-agent peer
+serve --port 7420 --url http://<tailscale-ip>:7420`; `peer rails detect`
+finds the node's llama-server on `127.0.0.1:18094`. Trust is a full mesh in
+each node's `~/.itonami/peers.edn`. `ITONAMI_PEER_PORT` moves the port (serve
+and the `itonami-p2p` rail) on a node where 7420 is taken.
+
 ## Tests
 
 ```
