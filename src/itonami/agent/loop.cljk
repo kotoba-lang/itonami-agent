@@ -52,12 +52,14 @@ Use tools to act; do not describe a tool call instead of making it. Independent 
         (recur (h/dirname d))))))
 
 (defn system-prompt
-  [{:keys [soul home]} {:keys [cwd platform load-context?]}]
+  "skills? false leaves out the skills index: listing skills to a run that has
+  no skill_view tool only costs tokens (on a busy rail, minutes per turn)."
+  [{:keys [soul home]} {:keys [cwd platform load-context? skills?] :or {skills? true}}]
   (str/join "\n\n"
             (remove str/blank?
                     [(or soul "You are a helpful agent running on the itonami plane.")
                      guidance
-                     (skills-index home)
+                     (when skills? (skills-index home))
                      (when load-context? (context-file cwd))
                      (str "# Runtime environment\n"
                           "- engine: itonami-agent (kotoba, Hermes-compatible)\n"
@@ -86,7 +88,8 @@ Use tools to act; do not describe a tool call instead of making it. Independent 
         emit (or on-event (fn [_]))
         usage (atom {"prompt_tokens" 0 "completion_tokens" 0 "total_tokens" 0})
         add-usage! (fn [u] (when u (swap! usage #(merge-with + % (select-keys u ["prompt_tokens" "completion_tokens" "total_tokens"])))))]
-    (p/loop [messages [{"role" "system" "content" (system-prompt prof {:cwd cwd :platform platform :load-context? load-context?})}
+    (p/loop [messages [{"role" "system" "content" (system-prompt prof {:cwd cwd :platform platform :load-context? load-context?
+                                                                     :skills? (boolean (some #{"skill_view"} names))})}
                        {"role" "user" "content" prompt}]
              n 0
              attempts []
