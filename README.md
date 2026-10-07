@@ -165,17 +165,19 @@ harness emits kotoba typed-subset source, and kotoba verifies each function
 wasm32-browser and run through `instantiateKotoba`). The search backtracks
 outward when the policy reports that no candidate fits.
 
-`system-one/loop.edn` encodes the run-loop rules of `src/itonami/agent/loop.cljk` — stop at `max_turns`, `budget_exhausted` when `elapsed > run_budget` (budget > 0), and the wrap-up notice at 80% of the budget (`5·elapsed > 4·budget`) — as `turn-allowed`, `budget-exhausted`, `wrap-up` and `may-continue` (11 812 exhaustive cases; checks use
+`system-one/loop.edn` encodes the run-loop rules of `src/itonami/agent/loop.cljk` — stop at `max_turns`, `budget_exhausted` when `elapsed > run_budget` (only for a positive budget: `pos?`, so zero or negative disables it), and the wrap-up notice at 80% of the budget (`5·elapsed > 4·budget`) — as `turn-allowed`, `budget-exhausted`, `wrap-up` and `may-continue` (15 016 exhaustive cases, including non-positive budgets; checks use
 independently written oracles). The harness commit is pinned in
 `kotoba-harness.pin.edn` and fetched into
-`${XDG_CACHE_HOME:-~/.cache}/kotoba-harness/<sha>`, outside this repository
-(override with `KOTOBA_HARNESS_HOME`).
+`${XDG_CACHE_HOME:-~/.cache}/kotoba-harness/<sha>` on first use (network),
+outside this repository, and reused only while that checkout is the pinned
+commit with a clean worktree (override with `KOTOBA_HARNESS_HOME`). The
+launcher is a kbb program and runs the harness in-process.
 
 ```sh
-sh bin/itonami-system-one validate   # offline: shape, catalog, baseline splice
-sh bin/itonami-system-one known      # kotoba verification of known-correct bodies
-sh bin/itonami-system-one wrong      # negative control (rejected)
-OPENROUTER_API_KEY=... sh bin/itonami-system-one jev
+bin/itonami-system-one validate   # no kotoba CLI, no model: shape, catalog, baseline splice
+bin/itonami-system-one known      # kotoba verification of known-correct bodies
+bin/itonami-system-one wrong      # negative control (rejected)
+OPENROUTER_API_KEY=... bin/itonami-system-one jev
 ```
 
 `known`/`wrong`/`jev` need a kotoba CLI that provides `-M check` and

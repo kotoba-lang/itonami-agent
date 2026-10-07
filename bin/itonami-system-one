@@ -1,39 +1,70 @@
-#!/usr/bin/env sh
-# System One Coding for itonami-agent through kotoba-lang/kotoba-harness.
-#
-#   bin/itonami-system-one [validate|known|wrong|jev|home] [project.edn]
-#
-# validate  offline: project shape, catalog, baseline splice (no kotoba, no model)
-# known     known-correct bodies verified by kotoba (check + wasm32-browser + instantiateKotoba)
-# wrong     negative control; must be rejected
-# jev       TypeSafe Jev chooses typed blocks (needs OPENROUTER_API_KEY; spends credit)
-# home      print the harness checkout path
-#
-# The harness is the commit pinned in kotoba-harness.pin.edn, fetched into
-# ${XDG_CACHE_HOME:-~/.cache}/kotoba-harness/<sha> -- outside this repository,
-# so nbb never finds this repository's nbb.edn above it -- unless
-# KOTOBA_HARNESS_HOME points at a checkout.
-# Verification also needs the kotoba CLI and amu's runtime/browser-host.mjs
-# (KOTOBA_BROWSER_HOST); see the kotoba-harness README.
-set -eu
-APP_DIR="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
-method="${1:-validate}"
-project="${2:-$APP_DIR/system-one/loop.edn}"
-case "$project" in /*) ;; *) project="$PWD/$project" ;; esac
+#!/usr/bin/env -S kbb --backend sci
+;; System One Coding for itonami-agent through kotoba-lang/kotoba-harness.
+;;
+;;   bin/itonami-system-one [validate|known|wrong|jev|home] [project.edn]
+;;
+;; validate  project shape, catalog, baseline splice (no kotoba CLI, no model)
+;; known     known-correct bodies verified by kotoba (check + wasm32-browser + instantiateKotoba)
+;; wrong     negative control; must be rejected
+;; jev       TypeSafe Jev chooses typed blocks (needs OPENROUTER_API_KEY; spends credit)
+;; home      print the harness checkout path
+;;
+;; The harness is the commit pinned in kotoba-harness.pin.edn. It is fetched on
+;; first use (network) into ${XDG_CACHE_HOME:-~/.cache}/kotoba-harness/<sha>,
+;; outside this repository, and reused only while that checkout is exactly the
+;; pinned commit with a clean worktree; otherwise it is fetched again. Set
+;; KOTOBA_HARNESS_HOME to use an existing checkout instead (no fetch).
+;; Verification also needs the kotoba CLI and amu's runtime/browser-host.mjs
+;; (KOTOBA_BROWSER_HOST); see the kotoba-harness README.
+(ns itonami-system-one.bin
+  (:require [nbb.classpath :as cp]
+            [clojure.edn :as edn]
+            [clojure.string :as str]
+            ["node:path" :as path]
+            ["node:fs" :as fs]
+            ["node:os" :as os]
+            ["node:child_process" :as child]))
 
-if [ -z "${KOTOBA_HARNESS_HOME:-}" ]; then
-  pin="$APP_DIR/kotoba-harness.pin.edn"
-  repo=$(sed -n 's/.*:repo "\([^"]*\)".*/\1/p' "$pin")
-  sha=$(sed -n 's/.*:sha "\([0-9a-f]\{40\}\)".*/\1/p' "$pin")
-  [ -n "$repo" ] && [ -n "$sha" ] || { echo "invalid $pin" >&2; exit 78; }
-  KOTOBA_HARNESS_HOME="${XDG_CACHE_HOME:-$HOME/.cache}/kotoba-harness/$sha"
-  if [ "$(git -C "$KOTOBA_HARNESS_HOME" rev-parse HEAD 2>/dev/null || true)" != "$sha" ]; then
-    rm -rf "$KOTOBA_HARNESS_HOME"
-    mkdir -p "$KOTOBA_HARNESS_HOME"
-    git init -q "$KOTOBA_HARNESS_HOME"
-    git -C "$KOTOBA_HARNESS_HOME" fetch -q --depth 1 "$repo" "$sha"
-    git -C "$KOTOBA_HARNESS_HOME" checkout -q --detach FETCH_HEAD
-  fi
-fi
-[ "$method" = home ] && { echo "$KOTOBA_HARNESS_HOME"; exit 0; }
-exec sh "$KOTOBA_HARNESS_HOME/bin/kotoba-harness" "$project" "$method" "$APP_DIR/target/system-one"
+(def app-dir (path/resolve (path/dirname (fs/realpathSync nbb.core/*file*)) ".."))
+(defn env [k] (let [v (aget (.-env js/process) k)] (when-not (str/blank? v) v)))
+(defn fail! [msg] (binding [*print-fn* *print-err-fn*] (println msg)) (js/process.exit 78))
+
+(defn git [& args]
+  (let [r (child/spawnSync "git" (clj->js args) #js {:encoding "utf8"})]
+    {:status (.-status r) :out (str/trim (str (.-stdout r))) :err (str (.-stderr r))}))
+
+(defn pinned-home []
+  (let [{:keys [repo sha]} (edn/read-string (fs/readFileSync (path/join app-dir "kotoba-harness.pin.edn") "utf8"))
+        _ (when-not (and (string? repo) (string? sha) (re-matches #"[0-9a-f]{40}" sha)) (fail! "invalid kotoba-harness.pin.edn"))
+        home (path/join (or (env "XDG_CACHE_HOME") (path/join (os/homedir) ".cache")) "kotoba-harness" sha)
+        clean? (and (= sha (:out (git "-C" home "rev-parse" "HEAD")))
+                    (let [s (git "-C" home "status" "--porcelain" "--untracked-files=all")]
+                      (and (zero? (:status s)) (str/blank? (:out s)))))]
+    (when-not clean?
+      (fs/rmSync home #js {:recursive true :force true})
+      (fs/mkdirSync home #js {:recursive true})
+      (doseq [step [["init" "-q" home]
+                    ["-C" home "fetch" "-q" "--depth" "1" repo sha]
+                    ["-C" home "checkout" "-q" "--detach" "FETCH_HEAD"]]]
+        (let [r (apply git step)]
+          (when-not (zero? (:status r))
+            (fail! (str "could not fetch the pinned kotoba-harness " sha " from " repo
+                        " (network needed on first use, or set KOTOBA_HARNESS_HOME): " (str/trim (:err r))))))))
+    home))
+
+;; Top-level forms only: nbb loads a `require` synchronously only at top level.
+(def method (or (first *command-line-args*) "validate"))
+(def project (path/resolve (or (second *command-line-args*) (path/join app-dir "system-one" "loop.edn"))))
+(def home (or (env "KOTOBA_HARNESS_HOME") (pinned-home)))
+(when (= "home" method) (println home) (js/process.exit 0))
+(aset (.-env js/process) "KOTOBA_HARNESS_HOME" home)
+(when (and (not= "validate" method) (not (env "KOTOBA_BROWSER_HOST")))
+  (fail! "set KOTOBA_BROWSER_HOST to amu's runtime/browser-host.mjs"))
+(when (and (= "jev" method) (not (env "OPENROUTER_API_KEY")) (env "KOTOBA_HARNESS_KEYCHAIN_SERVICE"))
+  (let [r (child/spawnSync "security" #js ["find-generic-password" "-s" (env "KOTOBA_HARNESS_KEYCHAIN_SERVICE")
+                                           "-a" (or (env "KOTOBA_HARNESS_KEYCHAIN_ACCOUNT") "OPENROUTER_API_KEY") "-w"]
+                           #js {:encoding "utf8" :stdio #js ["ignore" "pipe" "ignore"]})]
+    (when (zero? (.-status r)) (aset (.-env js/process) "OPENROUTER_API_KEY" (str/trim (.-stdout r))))))
+(cp/add-classpath (path/join home "src"))
+(require '[kotoba-harness.main])
+((resolve 'kotoba-harness.main/-main) project method (path/join app-dir "target" "system-one"))

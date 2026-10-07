@@ -8,7 +8,7 @@
   :literals [{:id "zero" :type :i64 :value 0} {:id "four" :type :i64 :value 4} {:id "five" :type :i64 :value 5} {:id "true" :type :bool :value true} {:id "false" :type :bool :value false}]
   :max-decisions 128 :max-depth 6 :candidate-limit 8}
  :baseline "(ns itonami.agent.loop-rules (:export [turn-allowed budget-exhausted wrap-up may-continue marker]))
-;; loop.cljk: exit at n >= max_turns; budget_exhausted when budget > 0 and elapsed > budget; wrap-up notice when elapsed > 0.8 * budget (5*elapsed > 4*budget).
+;; loop.cljk: exit at n >= max_turns; budget_exhausted when budget > 0 (pos?, so a negative budget disables it) and elapsed > budget; wrap-up notice when elapsed > 0.8 * budget (5*elapsed > 4*budget).
 (defn turn-allowed [n :i64 max-turns :i64] :bool false)
 (defn budget-exhausted [elapsed :i64 budget :i64] :bool false)
 (defn wrap-up [elapsed :i64 budget :i64] :bool false)
@@ -24,18 +24,18 @@
 (defn chk-turn-allowed-n [n :i64 bad :i64] :i64 (if (< n 13) (chk-turn-allowed-n (+ n 1) (chk-turn-allowed-x n 0 bad)) bad))
 (defn chk-turn-allowed-x [n :i64 x :i64 bad :i64] :i64 (if (< x 13) (chk-turn-allowed-x n (+ x 1) (+ bad (chk-case-turn-allowed n x))) bad))
 (defn chk-case-budget-exhausted [e :i64 b :i64] :i64 (chk-bool (budget-exhausted e b) (chk-exhausted e b)))
-(defn chk-budget-exhausted-e [e :i64 bad :i64] :i64 (if (< e 41) (chk-budget-exhausted-e (+ e 1) (chk-budget-exhausted-b e 0 bad)) bad))
+(defn chk-budget-exhausted-e [e :i64 bad :i64] :i64 (if (< e 41) (chk-budget-exhausted-e (+ e 1) (chk-budget-exhausted-b e -8 bad)) bad))
 (defn chk-budget-exhausted-b [e :i64 b :i64 bad :i64] :i64 (if (< b 41) (chk-budget-exhausted-b e (+ b 1) (+ bad (chk-case-budget-exhausted e b))) bad))
 (defn chk-case-wrap-up [e :i64 b :i64] :i64 (chk-bool (wrap-up e b) (chk-wrap e b)))
-(defn chk-wrap-up-e [e :i64 bad :i64] :i64 (if (< e 41) (chk-wrap-up-e (+ e 1) (chk-wrap-up-b e 0 bad)) bad))
+(defn chk-wrap-up-e [e :i64 bad :i64] :i64 (if (< e 41) (chk-wrap-up-e (+ e 1) (chk-wrap-up-b e -8 bad)) bad))
 (defn chk-wrap-up-b [e :i64 b :i64 bad :i64] :i64 (if (< b 41) (chk-wrap-up-b e (+ b 1) (+ bad (chk-case-wrap-up e b))) bad))
 (defn chk-case-may-continue [n :i64 x :i64 e :i64 b :i64] :i64 (chk-bool (may-continue n x e b) (* (chk-turn n x) (- 1 (chk-exhausted e b)))))
 (defn chk-may-continue-n [n :i64 bad :i64] :i64 (if (< n 7) (chk-may-continue-n (+ n 1) (chk-may-continue-x n 0 bad)) bad))
 (defn chk-may-continue-x [n :i64 x :i64 bad :i64] :i64 (if (< x 7) (chk-may-continue-x n (+ x 1) (chk-may-continue-e n x 0 bad)) bad))
-(defn chk-may-continue-e [n :i64 x :i64 e :i64 bad :i64] :i64 (if (< e 13) (chk-may-continue-e n x (+ e 1) (chk-may-continue-b n x e 0 bad)) bad))
+(defn chk-may-continue-e [n :i64 x :i64 e :i64 bad :i64] :i64 (if (< e 13) (chk-may-continue-e n x (+ e 1) (chk-may-continue-b n x e -4 bad)) bad))
 (defn chk-may-continue-b [n :i64 x :i64 e :i64 b :i64 bad :i64] :i64 (if (< b 13) (chk-may-continue-b n x e (+ b 1) (+ bad (chk-case-may-continue n x e b))) bad))
 "
  :checks {"turn-allowed" "(chk-turn-allowed-n 0 0)" "budget-exhausted" "(chk-budget-exhausted-e 0 0)" "wrap-up" "(chk-wrap-up-e 0 0)" "may-continue" "(chk-may-continue-n 0 0)"}
- :cases 11812
+ :cases 15016
  :known {"turn-allowed" "(< n max-turns)" "budget-exhausted" "(if (< 0 budget) (< budget elapsed) false)" "wrap-up" "(if (< 0 budget) (< (* 4 budget) (* 5 elapsed)) false)" "may-continue" "(if (turn-allowed n max-turns) (if (budget-exhausted elapsed budget) false true) false)"}
  :wrong {"turn-allowed" "(< n max-turns)" "budget-exhausted" "(< budget elapsed)" "wrap-up" "(if (< 0 budget) (< (* 4 budget) (* 5 elapsed)) false)" "may-continue" "(if (turn-allowed n max-turns) (if (budget-exhausted elapsed budget) false true) false)"}}
