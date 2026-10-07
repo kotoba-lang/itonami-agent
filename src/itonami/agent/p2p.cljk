@@ -309,7 +309,10 @@
   (let [bin (or (h/env "ITONAMI_AGENT_BIN") (throw (ex-info "ITONAMI_AGENT_BIN not set (start through bin/itonami-agent)" {})))]
     (js/Promise.
      (fn [resolve reject]
-       (let [child (cp/spawn bin #js ["peer" "exec"] #js {:stdio #js ["pipe" "pipe" "pipe"]})
+       ;; re-enter through the same interpreter and engine this process runs on
+       ;; (node + nbb cli.js), so a node without the kbb launcher works too
+       (let [child (cp/spawn (.-execPath js/process) #js [(aget (.-argv js/process) 1) bin "peer" "exec"]
+                             #js {:stdio #js ["pipe" "pipe" "pipe"]})
              out #js [] err #js []]
          (.on (.-stdout child) "data" #(.push out %))
          (.on (.-stderr child) "data" #(.push err %))

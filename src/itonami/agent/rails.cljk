@@ -32,7 +32,7 @@
 
 (def candidate-ports
   "Where local OpenAI-compatible servers usually listen."
-  [8095 8094 18195 11434 1234 8000 8001 8080 8081 5000 18194])
+  [8095 8094 18094 18195 11434 1234 8000 8001 8080 8081 5000 18194])
 
 (defn- fetch-text [url {:keys [method body timeout-s headers]}]
   (let [ctrl (js/AbortController.)
