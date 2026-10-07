@@ -17,7 +17,7 @@
     itonami-agent peer id | serve [--port 7420 --url U --max-runs 2]
                        | add <url> [--did D --trust] | trust <did> | list
                        | run -p P -z PROMPT                  run one turn on a trusted peer
-                       | rails [detect [--dry-run]]           this node's own inference rails
+                       | rails [detect [--dry-run] | add <base-url> --models a,b [--small]]  own rails
                        | authorities                         breaker state of the authority servers
 
   -z prints only the final text (exit 0), or `itonami-agent -z: <reason>` on
@@ -291,6 +291,12 @@
       "detect" (p/let [m (rails/detect {:skip-port (or (some-> (:port opts) (js/parseInt 10)) p2p/default-port)})]
                  (if (:dry-run opts) (prn m) (do (rails/write-rails! m) (println (str "wrote " (rails/rails-file)))))
                  (doseq [r (:local m)] (println (str "  " (:name r) "  " (:base-url r) "  agent=" (:agent? r) "  " (str/join "," (:models r))))))
+      "add" (let [m (rails/read-rails)
+                  r {:name (or (:name opts) (str "manual-" (count (:local m)))) :base-url (second args)
+                     :models (str/split (or (:models opts) "auto") #",")
+                     :priority (js/parseInt (or (:priority opts) "50") 10) :agent? (not (:small opts))}]
+              (rails/write-rails! (update m :local conj r))
+              (println (str "added rail " (:name r) " " (:base-url r))))
       (doseq [r (:local (rails/read-rails))]
         (println (str (:name r) "  " (:base-url r) "  p" (:priority r) "  agent=" (:agent? r) "  " (str/join "," (:models r))))))
 

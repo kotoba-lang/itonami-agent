@@ -46,7 +46,8 @@
 (defn probe
   "GET <base>/models -> model ids, or nil when nothing OpenAI-shaped answers."
   [base-url]
-  (-> (fetch-text (str base-url "/models") {:timeout-s 3})
+  ;; a single-slot llama-server answers /models only between generations
+  (-> (fetch-text (str base-url "/models") {:timeout-s 20})
       (p/then (fn [{:keys [status text]}]
                 (when (= 200 status)
                   (let [ids (try (mapv #(get % "id") (get (h/json-parse text) "data")) (catch :default _ nil))]
