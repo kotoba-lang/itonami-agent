@@ -160,7 +160,9 @@
   "Sorted [path sha256] pairs; its CID names the bundle. itonami.edn is left
   out of its own CID (it records the CID)."
   [files]
-  (vec (for [[p c] files :when (not= p "itonami.edn")] [p (h/sha256-hex c)])))
+  ;; sorted by path: a bundle that crossed the wire as JSON comes back as a
+  ;; hash map whose order is not the sender's
+  (vec (for [[p c] (sort-by key files) :when (not= p "itonami.edn")] [p (h/sha256-hex c)])))
 
 (defn bundle-cid [files]
   (h/cid-raw (h/json-str (bundle-manifest files))))

@@ -110,7 +110,10 @@ plain: true
     (is (str/starts-with? cid "bafkrei") "CIDv1 raw sha2-256 base32")
     (is (profile/verify-bundle cid files))
     (is (not (profile/verify-bundle cid (assoc files "SOUL.md" "changed"))))
-    (is (= cid (profile/bundle-cid (assoc files "itonami.edn" "{}"))) "itonami.edn is outside its own CID")))
+    (is (= cid (profile/bundle-cid (assoc files "itonami.edn" "{}"))) "itonami.edn is outside its own CID")
+    (testing "order-independent: a bundle back from JSON (a hash map) keeps its CID"
+      (let [big (into (sorted-map) (for [i (range 12)] [(str "data/f" i ".json") (str i)]))]
+        (is (= (profile/bundle-cid big) (profile/bundle-cid (into {} (shuffle (seq big))))))))))
 
 (deftest tool-surface
   (is (= ["terminal" "read_file" "write_file" "patch" "search_files" "skill_view"] (tools/tool-names ["hermes-cron"])))
