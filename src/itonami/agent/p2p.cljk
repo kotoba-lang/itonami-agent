@@ -40,7 +40,7 @@
             ["node:http" :as http]))
 
 (def protocol "itonami-agent-p2p/1")
-(def default-port 7420)
+(def default-port (or (some-> (h/env "ITONAMI_PEER_PORT") (js/parseInt 10)) 7420))
 
 (defn itonami-dir [] (h/expand (or (h/env "ITONAMI_DIR") "~/.itonami")))
 

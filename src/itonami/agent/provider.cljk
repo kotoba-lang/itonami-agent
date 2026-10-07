@@ -29,7 +29,10 @@
   "One {provider model base_url key_env} entry -> a callable hop."
   [config {:strs [provider model base_url key_env]}]
   (let [pc (get-in config ["providers" provider])
-        bi (get built-in provider)
+        bi (if (= provider "itonami-p2p")
+             ;; this node's own peer server, wherever it listens
+             {"base_url" (str "http://127.0.0.1:" (or (h/env "ITONAMI_PEER_PORT") "7420") "/v1")}
+             (get built-in provider))
         base (or base_url (get pc "base_url") (get bi "base_url")
                  (when (= provider (get-in config ["model" "provider"])) (get-in config ["model" "base_url"])))
         mc (get-in pc ["models" model])]
