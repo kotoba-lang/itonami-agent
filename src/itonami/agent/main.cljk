@@ -18,6 +18,7 @@
                        | add <url> [--did D --trust] | trust <did> | list
                        | run -p P -z PROMPT                  run one turn on a trusted peer
                        | rails [detect [--dry-run]]           this node's own inference rails
+                       | authorities                         breaker state of the authority servers
 
   -z prints only the final text (exit 0), or `itonami-agent -z: <reason>` on
   stderr with exit 1, as `hermes -z` does."
@@ -29,6 +30,7 @@
             [itonami.agent.cron :as cron]
             [itonami.agent.p2p :as p2p]
             [itonami.agent.rails :as rails]
+            [itonami.agent.provider :as provider]
             ["node:readline" :as readline]))
 
 (defn- parse-args
@@ -293,6 +295,15 @@
         (println (str (:name r) "  " (:base-url r) "  p" (:priority r) "  agent=" (:agent? r) "  " (str/join "," (:models r))))))
 
     "exec" (p2p/exec-from-stdin)
+
+    "authorities"
+    (let [hl (provider/read-health)]
+      (doseq [a provider/default-authorities
+              :let [{:strs [down_until status reason since]} (get hl a)]]
+        (println (str (.padEnd a 22)
+                      (if (and down_until (> down_until (h/now-ms)))
+                        (str "skipped for " (js/Math.ceil (/ (- down_until (h/now-ms)) 60000)) " min  (" status " since " since ": " reason ")")
+                        "in use")))))
 
     (die 2 (str "unknown peer command: " sub))))
 

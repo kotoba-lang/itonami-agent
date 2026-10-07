@@ -58,20 +58,69 @@
 
 (def default-deny-hosts
   "Third-party relays an itonami profile does not depend on. A rail must be
-  owned by a node (its own server, its mesh, a trusted peer) or by the
-  operator (kotoba, murakumo)."
+  owned by a node (its own server, its mesh, a trusted peer) or be one of the
+  operator's few authority servers."
   ["openrouter.ai"])
 
+(def default-authorities
+  "The few authority servers the decentralised plane may use while they are
+  healthy — never depend on: each sits behind a circuit breaker, and the
+  chain always also carries the itonami-p2p rail."
+  ["api.kotoba.cloud" "api.murakumo.cloud"])
+
+(def p2p-hop {"provider" "itonami-p2p" "model" "auto"})
+
+(defn authority-host [hop authorities]
+  (some #(when (str/includes? (str (:base-url hop)) %) %) authorities))
+
 (defn decentralize
-  "Drop hops whose base URL is a denied relay host. Applies to itonami
-  profiles (manifest present); :inference :deny-hosts overrides the default.
-  A profile without itonami.edn keeps its Hermes chain unchanged."
-  [hops manifest]
-  (if-not manifest
-    hops
-    (let [deny (get-in manifest [:inference :deny-hosts] default-deny-hosts)
-          kept (vec (remove (fn [hop] (some #(str/includes? (str (:base-url hop)) %) deny)) hops))]
-      (if (seq kept) kept hops))))
+  "For an itonami profile (manifest present): drop relay hops
+  (:inference :deny-hosts), mark authority hops (:inference :authorities) so
+  `complete` guards them with the breaker, and make sure the itonami-p2p rail
+  is on the chain so it never consists of authorities alone. A profile
+  without itonami.edn keeps its Hermes chain unchanged."
+  ([hops manifest] (decentralize hops manifest nil))
+  ([hops manifest config]
+   (if-not manifest
+     hops
+     (let [deny (get-in manifest [:inference :deny-hosts] default-deny-hosts)
+           auth (get-in manifest [:inference :authorities] default-authorities)
+           kept (vec (remove (fn [hop] (some #(str/includes? (str (:base-url hop)) %) deny)) hops))
+           kept (mapv #(if-let [a (authority-host % auth)] (assoc % :authority a) %) kept)
+           kept (if (some #(= "itonami-p2p" (:provider %)) kept)
+                  kept
+                  (conj kept (resolve-hop (or config {}) p2p-hop)))]
+       kept))))
+
+;; ---------------------------------------------------------------- authority circuit breaker
+
+(defn- health-file [] (h/join (h/expand (or (h/env "ITONAMI_DIR") "~/.itonami")) "authority-health.json"))
+
+(defn read-health []
+  (let [f (health-file)] (if (h/file? f) (try (h/json-parse (h/slurp f)) (catch :default _ {})) {})))
+
+(defn- write-health! [m] (h/spit-atomic (health-file) (h/json-str m 2)))
+
+(defn breaker-open? [host]
+  (when-let [{:strs [down_until]} (get (read-health) host)]
+    (> down_until (h/now-ms))))
+
+(defn cooldown-ms
+  "How long an authority is skipped after a failure of this kind."
+  [{:keys [status error]}]
+  (cond
+    (= 402 status) (* 30 60000)                    ; out of credit: not coming back in minutes
+    (#{401 403} status) (* 30 60000)               ; credentials refused
+    (= 429 status) (* 2 60000)                     ; busy
+    :else (* 5 60000)))                            ; 5xx, transport, empty
+
+(defn record-authority! [host err]
+  (let [m (read-health)]
+    (write-health! (if err
+                     (assoc m host {"down_until" (+ (h/now-ms) (cooldown-ms err)) "status" (:status err)
+                                    "reason" (subs (str (:error err)) 0 (min 160 (count (str (:error err)))))
+                                    "since" (h/iso-local)})
+                     (dissoc m host)))))
 
 (defn- fetch-json
   [url {:keys [headers body timeout-s]}]
@@ -117,13 +166,17 @@
 
 (defn- retryable? [{:keys [status error]}]
   (or (nil? status) (= 429 status) (<= 500 status 599)
-      (re-find #"(?i)busy|capacity|timeout|aborted|transport" (str error))))
+      (re-find #"(?i)busy|capacity|timeout|aborted|transport|skipped" (str error))))
 
 (defn- complete-round
   [hops env {:keys [deadline-ms on-hop] :as req} attempts]
   (p/loop [[hop & more] hops attempts attempts]
     (if (nil? hop)
       {:err (or (last attempts) {:error "no provider configured"}) :attempts attempts}
+      (if (and (:authority hop) (breaker-open? (:authority hop)))
+        ;; authority known to be down: skip at no cost, the decentralised rails carry the turn
+        (p/recur more (conj attempts {:provider (:provider hop) :model (:model hop) :status nil
+                                      :error (str "skipped: authority " (:authority hop) " breaker open")}))
       (p/let [;; share the time left fairly among the hops still to try, so one
               ;; slow rail cannot starve the fallbacks behind it
               hop (if deadline-ms
@@ -132,10 +185,11 @@
                     hop)
               t0 (h/now-ms)
               r (complete-hop hop env req)
-              _ (when on-hop (on-hop hop r (- (h/now-ms) t0)))]
+              _ (when on-hop (on-hop hop r (- (h/now-ms) t0)))
+              _ (when (:authority hop) (record-authority! (:authority hop) (:err r)))]
         (if (:ok r)
           (assoc r :attempts attempts)
-          (p/recur more (conj attempts (:err r))))))))
+          (p/recur more (conj attempts (:err r)))))))))
 
 (defn complete
   "Walk the chain. Resolves to {:ok resp :attempts [...]} or {:err last :attempts [...]}.

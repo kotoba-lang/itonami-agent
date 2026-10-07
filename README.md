@@ -109,8 +109,15 @@ any OpenAI client on node A (itonami-agent, Hermes)
   `:inference :deny-hosts` (default `openrouter.ai`) are dropped from the
   chain; a profile without `itonami.edn` keeps its Hermes chain. Turns run for
   a peer always get `itonami-p2p` on their chain.
-- Operator rails (kotoba, murakumo cloud) stay as later hops; a profile can
-  drop them too by listing their hosts in `:deny-hosts`.
+- **Authority servers, used but not depended on.** kotoba
+  (`api.kotoba.cloud`) and murakumo (`api.murakumo.cloud`) are the few
+  authority servers of the plane (`:inference :authorities`). They keep their
+  place on a profile's chain while healthy, but each sits behind a circuit
+  breaker shared by the node (`~/.itonami/authority-health.json`): a failure
+  parks the authority (402/401/403 → 30 min, 429 → 2 min, 5xx/transport → 5
+  min) and later turns skip it at no cost; a success clears it. The chain of
+  an itonami profile always also carries `itonami-p2p`, so it never consists
+  of authorities alone. `peer authorities` shows the breaker state.
 
 ### murakumo
 

@@ -75,7 +75,7 @@ Use tools to act; do not describe a tool call instead of making it. Independent 
   (let [max-turns (or max-turns (get-in config ["agent" "max_turns"]) (get config "max_turns") 90)
         budget-ms (* 1000 (or budget-s (get-in config ["agent" "run_budget_seconds"]) 0))
         hops (provider/decentralize (provider/chain config {:model model :provider provider :pinned? pinned?})
-                                    (:itonami prof))
+                                    (:itonami prof) config)
         names (tools/tool-names (or toolsets ["hermes-cli"]))
         schemas (tools/tool-schemas names)
         writes (atom [])

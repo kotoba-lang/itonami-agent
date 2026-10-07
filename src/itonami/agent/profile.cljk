@@ -194,6 +194,9 @@
      ;; rails a turn may use: this node's / peers' own servers first, the
      ;; operator rails after; third-party relays are dropped from the chain
      :inference {:rails [:itonami-p2p :kotoba :murakumo]
+                 ;; few authority servers: used while healthy, behind a
+                 ;; circuit breaker, never the only rail on the chain
+                 :authorities ["api.kotoba.cloud" "api.murakumo.cloud"]
                  :deny-hosts ["openrouter.ai"]}
      :state {:workspace :host-local
              :results :cid-receipts

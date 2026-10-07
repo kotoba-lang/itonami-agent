@@ -61,6 +61,14 @@ plain: true
               {:provider "openrouter-free" :base-url "https://openrouter.ai/api/v1"}
               {:provider "itonami-p2p" :base-url "http://127.0.0.1:7420/v1"}]]
     (is (= ["kotoba" "itonami-p2p"] (map :provider (provider/decentralize hops {:itonami/schema "x"}))))
+    (is (= "api.kotoba.cloud" (:authority (first (provider/decentralize hops {:itonami/schema "x"})))))
+    (testing "a chain of authorities alone gets the p2p rail appended"
+      (is (= ["kotoba" "itonami-p2p"] (map :provider (provider/decentralize [(first hops)] {:itonami/schema "x"})))))
+    (testing "breaker: a 402 parks the authority, a success clears it"
+      (provider/record-authority! "api.example.test" {:status 402 :error "credit"})
+      (is (provider/breaker-open? "api.example.test"))
+      (provider/record-authority! "api.example.test" nil)
+      (is (not (provider/breaker-open? "api.example.test"))))
     (is (= 3 (count (provider/decentralize hops nil))) "plain Hermes profiles keep their chain")
     (is (= ["itonami-p2p" "murakumo"]
            (map #(get % "provider") (get (p2p/ensure-rail {"model" {"provider" "kotoba"}} "murakumo") "fallback_providers"))))))
