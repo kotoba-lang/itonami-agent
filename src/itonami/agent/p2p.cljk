@@ -341,6 +341,56 @@
 (def ^:private active-runs (atom 0))
 (def ^:private runs (atom {}))
 
+;; ---------------------------------------------------------------- self-reported health
+
+(defn- exec-async
+  "Run argv without blocking the event loop (the peer server must keep
+  answering while a probe like netstat walks 70k sockets). Resolves to stdout or nil."
+  [argv timeout-ms]
+  (js/Promise. (fn [resolve]
+                 (cp/execFile (first argv) (clj->js (rest argv)) #js {:timeout timeout-ms :maxBuffer (* 64 1024 1024)}
+                              (fn [err stdout _] (resolve (when-not err (str stdout))))))))
+
+(def ^:private health-cache (atom {:at 0 :health nil}))
+
+(defn- revision []
+  (let [f (h/join (h/dirname (h/dirname (h/env "ITONAMI_AGENT_BIN"))) "REVISION")]
+    (or (when (h/file? f) (str/trim (h/slurp f)))
+        (some-> (h/run-process ["git" "-C" (h/dirname (h/dirname (h/env "ITONAMI_AGENT_BIN"))) "rev-parse" "--short" "HEAD"] {:timeout-ms 3000})
+                :stdout str/trim not-empty))))
+
+(defn node-health
+  "What this node can say about itself, refreshed at most every 30 s:
+  load, memory pressure, swap, TIME_WAIT sockets, ephemeral port floor, and
+  whether each of its own rails answers. Read-only."
+  []
+  (if (and (:health @health-cache) (< (- (h/now-ms) (:at @health-cache)) 30000))
+    (p/resolved (:health @health-cache))
+    (p/let [darwin? (= "darwin" (.-platform js/process))
+            level (when darwin? (exec-async ["sysctl" "-n" "kern.memorystatus_vm_pressure_level"] 3000))
+            mp (when darwin? (exec-async ["memory_pressure"] 5000))
+            swap (when darwin? (exec-async ["sysctl" "-n" "vm.swapusage"] 3000))
+            pfirst (when darwin? (exec-async ["sysctl" "-n" "net.inet.ip.portrange.first"] 3000))
+            ns (exec-async ["netstat" "-an" "-p" "tcp"] 15000)
+            rails-status (p/all (for [r (:local (rails/read-rails))]
+                                  (p/let [t0 (h/now-ms) ids (rails/probe (:base-url r))]
+                                    {"name" (:name r) "ok" (boolean ids) "ms" (- (h/now-ms) t0) "agent" (boolean (:agent? r))})))]
+      (let [os (js/require "node:os")
+            hl {"at" (h/iso-local)
+                "revision" (revision)
+                "uptime_s" (js/Math.floor (.uptime os))
+                "loadavg" (mapv #(/ (js/Math.round (* 100 %)) 100) (js->clj (.loadavg os)))
+                "mem_total_gb" (js/Math.round (/ (.totalmem os) 1073741824))
+                "pressure_level" (some-> level str/trim js/parseInt)   ; 1 normal, 2 warn, 4 critical
+                "mem_free_pct" (some->> mp (re-find #"free percentage:\s*(\d+)") second js/parseInt)
+                "swap_used_mb" (some->> swap (re-find #"used = ([0-9.]+)M") second js/parseFloat js/Math.round)
+                "tcp_time_wait" (when ns (count (re-seq #"TIME_WAIT" ns)))
+                "ephemeral_first" (some-> pfirst str/trim js/parseInt)
+                "active_runs" @active-runs
+                "rails" (vec rails-status)}]
+        (reset! health-cache {:at (h/now-ms) :health hl})
+        hl))))
+
 (defn- loopback? [^js req]
   (contains? #{"127.0.0.1" "::1" "::ffff:127.0.0.1"} (.. req -socket -remoteAddress)))
 
@@ -410,7 +460,8 @@
            (let [url (.-url req) method (.-method req)]
              (-> (cond
                    (and (= method "GET") (= url "/itonami/v1/peer"))
-                   (let [{:keys [peers]} (read-peers)]
+                   (p/let [{:keys [peers]} (read-peers)
+                           health (-> (node-health) (p/catch (fn [_] nil)))]
                      (reply res 200 (sign-envelope node {"did" (:did node) "url" public-url
                                                          "murakumo_did" (h/env "MURAKUMO_NODE_DID")
                                                          "load" @active-runs "max_runs" max-runs
@@ -418,6 +469,7 @@
                                                          ;; models this node lends from its own rails
                                                          "models" (rails/all-models (rails/read-rails))
                                                          "agent_models" (rails/agent-models (rails/read-rails))
+                                                         "health" health
                                                          "profiles" (local-itonami-profiles)
                                                          "peers" (mapv :url peers)})))
 
