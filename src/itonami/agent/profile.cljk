@@ -133,12 +133,19 @@
 (defn bundle-files
   "path -> string content of what crosses to a peer: the profile's definition,
   never its secrets, workspace, sessions, memories or run state."
-  [home {:keys [skills]}]
+  [home {:keys [skills dirs]}]
   (let [f (fn [rel] (let [p (h/join home rel)] (when (h/file? p) [rel (h/slurp p)])))
         jobs (read-jobs home)
         scripts (->> (h/walk-files (h/join home "scripts") (fn [r] (or (str/includes? r "__pycache__") (str/starts-with? (h/basename r) "."))))
                      (remove #(re-find #"\.(sh|bash)$" %))
                      (map #(f (str "scripts/" %))))
+        ;; extra directories the profile declares in itonami.edn :bundle :dirs
+        ;; (e.g. the data a bot's scripts read), so a peer gets them by CID too
+        dir-files (for [d dirs
+                        :when (and (string? d) (not (str/includes? d "..")) (not (str/starts-with? d "/"))
+                                   (not (#{"workspace" "sessions" "memories" "logs" "cache" "cron" "skills"} d)))
+                        r (h/walk-files (h/join home d) (fn [r] (str/starts-with? (h/basename r) ".")))]
+                    (f (str d "/" r)))
         skill-files (for [s skills
                           r (h/walk-files (h/join home "skills" s) (fn [r] (str/starts-with? (h/basename r) ".")))]
                       (f (str "skills/" s "/" r)))]
@@ -147,7 +154,7 @@
                   (concat [(f "SOUL.md") (f "profile.yaml") (f "itonami.edn")
                            (when-let [c (bundle-config-text home)] ["config.yaml" c])
                            ["cron/jobs.json" (h/json-str {"jobs" (mapv #(select-keys % job-definition-keys) (get jobs "jobs"))} 2)]]
-                          scripts skill-files)))))
+                          scripts dir-files skill-files)))))
 
 (defn bundle-manifest
   "Sorted [path sha256] pairs; its CID names the bundle. itonami.edn is left
@@ -218,7 +225,7 @@
   jobs or scripts changed) and write it back. Returns the manifest."
   [home]
   (let [m (read-edn-file (h/join home "itonami.edn"))
-        files (bundle-files home {:skills (get-in m [:bundle :skills])})
+        files (bundle-files home (select-keys (:bundle m) [:skills :dirs]))
         m (assoc m :bundle (merge (:bundle m) {:cid (bundle-cid files) :files (count files)}))]
     (write-manifest! home m)
     m))

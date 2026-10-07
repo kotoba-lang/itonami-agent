@@ -210,7 +210,7 @@
 
     "bundle"
     (let [prof (profile/load-profile (first args) {:secrets? false})
-          files (profile/bundle-files (:home prof) {:skills (get-in prof [:itonami :bundle :skills])})]
+          files (profile/bundle-files (:home prof) (select-keys (get-in prof [:itonami :bundle]) [:skills :dirs]))]
       (println (profile/bundle-cid files))
       (doseq [[path sha] (profile/bundle-manifest files)] (println (str "  " (subs sha 0 12) "  " path))))
 
@@ -277,12 +277,13 @@
     (p/let [infos (p2p/discover)
             {:keys [trusted]} (p2p/read-peers)]
       (doseq [i infos]
+        (when-not (= (:did i) (:did (p2p/node-key)))
         (println (str (.padEnd (str (:url i)) 32)
                       (if (:error i) (str "unreachable: " (:error i))
                           (str (:did i) (if (contains? trusted (:did i)) "  trusted" "  untrusted")
                                "  load " (get i "load") "/" (get i "max_runs")
-                               "  rails " (str/join "," (get i "rails"))
-                               (when (get i "murakumo_did") (str "  murakumo " (get i "murakumo_did")))))))))
+                               "  models " (str/join "," (get i "agent_models"))
+                               (when (get i "murakumo_did") (str "  murakumo " (get i "murakumo_did"))))))))))
 
     "run" (oneshot (assoc opts :peer true))
 

@@ -202,7 +202,7 @@
   (some (fn [{:strs [name]}]
           (let [home (profile/home name)
                 m (profile/read-edn-file (h/join home "itonami.edn"))
-                files (profile/bundle-files home {:skills (get-in m [:bundle :skills])})]
+                files (profile/bundle-files home (select-keys (:bundle m) [:skills :dirs]))]
             (when (= cid (profile/bundle-cid files)) {"name" name "files" files})))
         (local-itonami-profiles)))
 
@@ -562,7 +562,7 @@
   (let [node (node-key)
         home (:home prof)
         m (:itonami prof)
-        files (profile/bundle-files home {:skills (get-in m [:bundle :skills])})
+        files (profile/bundle-files home (select-keys (:bundle m) [:skills :dirs]))
         cid (profile/bundle-cid files)]
     (p/let [sub (http-json (str (:url peer) "/itonami/v1/run")
                            {:method "POST" :timeout-s 60
