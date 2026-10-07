@@ -21,7 +21,7 @@ the two can be swapped per profile.
 |---|---|
 | `SOUL.md`, `profile.yaml`, `config.yaml`, `.env`, `secrets.command` | read the same way. YAML reader is checked against PyYAML on all 1,954 host files: 0 differences |
 | `model` / `providers` / `fallback_providers`, job pin disables fallback | same resolution order (`cron/scheduler.py`, `runtime_provider_custom.py`) |
-| `agent.max_turns`, `agent.run_budget_seconds` (80 % wrap-up notice, hop timeout ≤ ½ remaining budget) | same |
+| `agent.max_turns`, `agent.run_budget_seconds` (80 % wrap-up notice, hop timeout ≤ ½ remaining budget) | same; plus up to 3 rounds over the chain with backoff when every hop failed transiently (429 / 5xx / transport) |
 | tools `terminal read_file write_file patch search_files web_search web_extract skill_view memory`; toolsets `hermes-cli`, `hermes-cron`, `terminal`, `file`, `web`, `skills`, `memory` | same names and argument shapes; results are JSON strings |
 | `cron/jobs.json` (all fields), 5-field cron / interval / once schedules | read and written in Hermes' format; Hermes' own `cron.jobs.load_jobs()` / `get_due_jobs()` read what itonami writes |
 | cron prompt: `_CRON_HINT`, `## Script Output` / `## Script Error` block, empty stdout and `{"wakeAgent": false}` skip, `[SILENT]`, `[CRON_FAILURE]` | identical text and semantics |
@@ -93,6 +93,19 @@ uses murakumo as the shared inference rail (`murakumo/free`, `mishima`) and
 keeps agent execution on its own peer protocol. Making agent turns a
 murakumo job kind is a change on the murakumo side (`poll_worker.cljk`) and
 not done here.
+
+## Resident gateway
+
+`~/Library/LaunchAgents/cloud.itonami.agent.gateway.plist` runs
+`bin/itonami-agent gateway run --interval 60` (KeepAlive). Every minute it
+ticks each adopted profile that has a due job — profiles independently, each
+under its own `cron/.itonami-tick.lock`, secrets resolved only when a job is
+due. Logs: `~/.itonami/logs/gateway.log`.
+
+```
+launchctl kickstart -k gui/$(id -u)/cloud.itonami.agent.gateway   # restart
+launchctl bootout gui/$(id -u)/cloud.itonami.agent.gateway         # stop
+```
 
 ## Tests
 

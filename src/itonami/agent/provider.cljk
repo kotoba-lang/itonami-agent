@@ -96,13 +96,13 @@
                                     :provider (:provider hop)}}))))
           (p/catch (fn [e] {:err (hop-error hop nil (str "transport: " (.-message e)))}))))))
 
-(defn complete
-  "Walk the chain. Resolves to {:ok resp :attempts [...]} or {:err last :attempts [...]}.
-  req may carry :deadline-ms (epoch ms): each hop's timeout is capped at half
-  the time left (min 60 s), as Hermes caps its stale timeout by run budget.
-  :on-hop (fn [hop result-or-nil ms]) observes each hop."
-  [hops env {:keys [deadline-ms on-hop] :as req}]
-  (p/loop [[hop & more] hops attempts []]
+(defn- retryable? [{:keys [status error]}]
+  (or (nil? status) (= 429 status) (<= 500 status 599)
+      (re-find #"(?i)busy|capacity|timeout|aborted|transport" (str error))))
+
+(defn- complete-round
+  [hops env {:keys [deadline-ms on-hop] :as req} attempts]
+  (p/loop [[hop & more] hops attempts attempts]
     (if (nil? hop)
       {:err (or (last attempts) {:error "no provider configured"}) :attempts attempts}
       (p/let [hop (if deadline-ms
@@ -114,3 +114,23 @@
         (if (:ok r)
           (assoc r :attempts attempts)
           (p/recur more (conj attempts (:err r))))))))
+
+(defn complete
+  "Walk the chain. Resolves to {:ok resp :attempts [...]} or {:err last :attempts [...]}.
+  req may carry :deadline-ms (epoch ms): each hop's timeout is capped at half
+  the time left (min 60 s), as Hermes caps its stale timeout by run budget.
+  When every hop of a round failed with a transient error (429 / 5xx /
+  transport), wait and walk the chain again — up to :rounds (default 3) and
+  only while the deadline leaves room — instead of failing the turn on a
+  momentarily saturated fleet. :on-hop (fn [hop result-or-nil ms]) observes
+  each hop."
+  [hops env {:keys [deadline-ms rounds] :or {rounds 3} :as req}]
+  (p/loop [round 1 attempts []]
+    (p/let [r (complete-round hops env req attempts)]
+      (let [round-errs (take-last (count hops) (:attempts r))
+            wait-ms (* 15000 round)]
+        (if (and (:err r) (< round rounds)
+                 (every? retryable? round-errs)
+                 (or (nil? deadline-ms) (> (- deadline-ms (h/now-ms)) (+ wait-ms 120000))))
+          (p/let [_ (p/delay wait-ms)] (p/recur (inc round) (:attempts r)))
+          r)))))

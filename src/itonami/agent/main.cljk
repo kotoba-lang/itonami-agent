@@ -237,14 +237,16 @@
                                                                          (catch :default _ nil))
                                                                        [:runtime :scheduler])))
                                       (profile/names))]
-                  (-> (p/loop [[n & more] adopted]
-                        (when n
-                          (p/let [r (-> (cron/tick (profile/load-profile n) {:executor (executor opts)})
-                                        (p/catch (fn [e] {:skipped (.-message e)})))]
-                            (when (and (sequential? r) (seq r))
-                              (println (str (h/iso-local) " " n " " (str/join ", " (map #(str (:job %) "=" (:status %)) r)))))
-                            (p/recur more))))
-                      (p/finally (fn [] (js/setTimeout cycle interval))))))]
+                  ;; each profile ticks independently (its own cron/.itonami-tick.lock),
+                  ;; so a long run in one profile never delays another's schedule
+                  ;; secrets (keychain helper) are resolved only when a job is due
+                  (doseq [n adopted
+                          :when (some #(cron/due? % (js/Date.)) (cron/read-jobs (profile/home n)))]
+                    (-> (p/let [r (cron/tick (profile/load-profile n) {:executor (executor opts)})]
+                          (when (and (sequential? r) (seq r))
+                            (println (str (h/iso-local) " " n " " (str/join ", " (map #(str (:job %) "=" (:status %)) r))))))
+                        (p/catch (fn [e] (println (str (h/iso-local) " " n " tick failed: " (.-message e)))))))
+                  (js/setTimeout cycle interval)))]
     (println (str "itonami-agent gateway: ticking adopted profiles every " (/ interval 1000) "s"))
     (h/spit (h/join (p2p/itonami-dir) "gateway.pid") (str (.-pid js/process)))
     (cycle)))
