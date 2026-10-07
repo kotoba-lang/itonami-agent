@@ -54,7 +54,7 @@
       (p/catch (fn [_] nil))))
 
 (defn- small-model? [ids]
-  (every? #(re-find #"(?i)(0\.[0-9]+b|1\.?[0-9]?b)\b|-0\.6b|-1b" (str %)) ids))
+  (some #(re-find #"(?i)(0\.[0-9]+b|1\.?[0-9]?b)\b|-0\.6b|-1b" (str %)) ids))
 
 (defn detect
   "Probe candidate-ports on loopback. Resolves to a rails map (not written).
@@ -65,7 +65,19 @@
                          (p/let [ids (probe base)] (when ids [port base ids]))))]
     {:local (vec (map-indexed
                   (fn [i [port base ids]]
-                    (let [ids (vec (remove #(str/starts-with? (str %) "/") ids))]
+                    (let [;; llama-server names its model by file path: serve it under the
+                          ;; file's base name, and under the deployment directory name
+                          ;; (/…/mishima/model/x.gguf -> "mishima") so peers can ask for it
+                          ids (vec (distinct
+                                    (mapcat (fn [id]
+                                              (let [id (str id)]
+                                                (if (str/starts-with? id "/")
+                                                  (let [parts (str/split id #"/")
+                                                        base (str/replace (last parts) #"\.gguf$" "")
+                                                        dep (some (fn [[a b]] (when (= b "model") a)) (partition 2 1 parts))]
+                                                    (remove #(or (nil? %) (= % "model")) [dep base]))
+                                                  [id])))
+                                            ids)))]
                       {:name (str "local-" port) :base-url base :models ids
                        :priority (if (small-model? ids) (+ 100 i) i)
                        :agent? (not (small-model? ids))}))
