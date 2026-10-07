@@ -1,0 +1,2 @@
+;; Written in .cljk from the start (no .clj/.cljs origin).
+{:origin :cljk}

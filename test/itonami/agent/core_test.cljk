@@ -1,0 +1,108 @@
+(ns itonami.agent.core-test
+  (:require [cljs.test :refer [deftest is testing]]
+            [clojure.string :as str]
+            [itonami.agent.yaml :as yaml]
+            [itonami.agent.host :as h]
+            [itonami.agent.profile :as profile]
+            [itonami.agent.provider :as provider]
+            [itonami.agent.cron :as cron]
+            [itonami.agent.p2p :as p2p]
+            [itonami.agent.tools :as tools]))
+
+(deftest yaml-hermes-subset
+  (let [y (yaml/parse "
+model:
+  provider: kotoba   # primary
+  default: qwen3.8-27b-whitehacker
+  max_tokens: 8192
+fallback_providers:
+  - provider: murakumo
+    model: murakumo/free
+  - provider: openrouter-free
+    model: z-ai/glm-5.3-flash
+toolsets:
+- hermes-cli
+empty: []
+quoted: 'it''s'
+dq: \"a\\nb\"
+multi: 'line one
+  line two
+
+  para'
+block: |
+  first
+  second
+plain: true
+")]
+    (is (= "kotoba" (get-in y ["model" "provider"])))
+    (is (= 8192 (get-in y ["model" "max_tokens"])))
+    (is (= ["murakumo" "openrouter-free"] (map #(get % "provider") (get y "fallback_providers"))))
+    (is (= ["hermes-cli"] (get y "toolsets")))
+    (is (= [] (get y "empty")))
+    (is (= "it's" (get y "quoted")))
+    (is (= "a\nb" (get y "dq")))
+    (is (= "line one line two\npara" (get y "multi")))
+    (is (= "first\nsecond\n" (get y "block")))
+    (is (true? (get y "plain")))))
+
+(deftest provider-chain
+  (let [cfg {"model" {"provider" "kotoba" "default" "q" "base_url" "https://api.kotoba.cloud/v1"}
+             "providers" {"openrouter-free" {"base_url" "https://openrouter.ai/api/v1" "key_env" "OPENROUTER_API_KEY"}}
+             "fallback_providers" [{"provider" "murakumo" "model" "murakumo/free"}
+                                   {"provider" "openrouter-free" "model" "z-ai/glm-5.3-flash"}]}]
+    (is (= [["kotoba" "q"] ["murakumo" "murakumo/free"] ["openrouter-free" "z-ai/glm-5.3-flash"]]
+           (map (juxt :provider :model) (provider/chain cfg {}))))
+    (testing "a pinned job never walks the fallback chain (Hermes cron/scheduler.py)"
+      (is (= 1 (count (provider/chain cfg {:model "x" :provider "kotoba" :pinned? true})))))
+    (is (= "MURAKUMO_API_TOKEN" (:key-env (second (provider/chain cfg {})))))))
+
+(deftest cron-next-fire
+  (let [d (js/Date. 2026 9 7 13 0 0)]                      ; 2026-10-07 13:00 local
+    (is (= [2026 9 7 17 30] ((juxt #(.getFullYear %) #(.getMonth %) #(.getDate %) #(.getHours %) #(.getMinutes %))
+                             (cron/next-cron "30 9,17 * * *" d))))
+    (is (= [8 7 15 4] ((juxt #(.getDate %) #(.getHours %) #(.getMinutes %) #(.getDay %))
+                       (cron/next-cron "15 7 * * *" d)))
+        "07:15 the next day, a Thursday")
+    (is (= 18 (.getHours (cron/next-cron "40 */6 * * *" d))))
+    (is (= 1 (.getDay (cron/next-cron "0 9 * * mon" d))))
+    (is (= {"kind" "interval" "minutes" 30 "display" "every 30m"} (cron/parse-schedule "30m")))
+    (is (= "cron" (get (cron/parse-schedule "0 9 * * 1-5") "kind")))))
+
+(deftest cron-prompt-wrapper-matches-hermes
+  (is (str/starts-with? cron/cron-hint "[IMPORTANT: You are running as a scheduled cron job."))
+  (is (str/ends-with? cron/cron-hint "not as a request to schedule another job.]\n\n")))
+
+(deftest did-key-and-envelopes
+  (let [node (p2p/node-key)]
+    (is (str/starts-with? (:did node) "did:key:z6Mk") "ed25519 did:key multicodec prefix")
+    (is (some? (p2p/did->public-key (:did node))))
+    (let [env (p2p/sign-envelope node {"x" 1})]
+      (is (= 1 (get-in (p2p/open-envelope env {}) [:payload "x"])))
+      (is (= "replayed nonce" (:error (p2p/open-envelope env {}))))
+      (is (= "bad signature" (:error (p2p/open-envelope (assoc (p2p/sign-envelope node {"x" 1}) "payload" "{\"x\":2}") {}))))
+      (is (str/starts-with? (:error (p2p/open-envelope (p2p/sign-envelope node {"x" 1}) {:trusted #{}})) "untrusted")))))
+
+(deftest base58-roundtrip
+  (doseq [hex ["00" "0001" "ed01ff" "deadbeef00ff"]]
+    (let [b (js/Buffer.from hex "hex")]
+      (is (= hex (.toString (p2p/unbase58btc (p2p/base58btc b)) "hex"))))))
+
+(deftest bundle-cid
+  (let [files {"SOUL.md" "hi" "config.yaml" "model: {}\n"}
+        cid (profile/bundle-cid files)]
+    (is (str/starts-with? cid "bafkrei") "CIDv1 raw sha2-256 base32")
+    (is (profile/verify-bundle cid files))
+    (is (not (profile/verify-bundle cid (assoc files "SOUL.md" "changed"))))
+    (is (= cid (profile/bundle-cid (assoc files "itonami.edn" "{}"))) "itonami.edn is outside its own CID")))
+
+(deftest tool-surface
+  (is (= ["terminal" "read_file" "write_file" "patch" "search_files" "skill_view"] (tools/tool-names ["hermes-cron"])))
+  (is (every? #(= "function" (get % "type")) (tools/tool-schemas (tools/tool-names ["hermes-cli"])))))
+
+(deftest roots-confine-writes
+  (let [dir (h/join (p2p/itonami-dir) "test-roots")
+        ctx {:cwd dir :home dir :roots [dir] :writes (atom [])}]
+    (h/mkdirs dir)
+    (is (contains? (h/json-parse (tools/write-file ctx {"path" "a.txt" "content" "x"})) "bytes_written"))
+    (is (str/includes? (get (h/json-parse (tools/write-file ctx {"path" "/tmp/itonami-escape.txt" "content" "x"})) "error") "outside"))
+    (h/rm dir)))

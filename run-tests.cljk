@@ -1,0 +1,16 @@
+#!/usr/bin/env -S kbb --backend sci --classpath src:test
+;; kbb --backend sci --classpath src:test run-tests.cljk
+;; Uses a throwaway ITONAMI_DIR so the node key under ~/.itonami is untouched.
+(ns run-tests
+  (:require [cljs.test :as t]
+            ["node:os" :as os]
+            ["node:path" :as path]))
+
+(aset (.-env js/process) "ITONAMI_DIR" (path/join (os/tmpdir) (str "itonami-agent-test-" (.-pid js/process))))
+
+(require 'itonami.agent.core-test)
+
+(defmethod t/report [:cljs.test/default :end-run-tests] [m]
+  (when-not (t/successful? m) (js/process.exit 1)))
+
+(t/run-tests 'itonami.agent.core-test)

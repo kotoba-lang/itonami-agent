@@ -1,0 +1,16 @@
+#!/usr/bin/env -S kbb --backend sci
+;; itonami-agent — a Hermes-compatible agent written in kotoba. The command
+;; surface is in src/itonami/agent/main.cljk. No dependencies beyond the kbb
+;; engine: src/ is put on the classpath relative to this file, so the
+;; launcher works from any cwd and through a symlink on PATH.
+(ns itonami-agent.bin
+  (:require [nbb.classpath :as cp]
+            ["node:path" :as path]
+            ["node:fs" :as fs]))
+
+(cp/add-classpath (path/resolve (path/dirname (fs/realpathSync nbb.core/*file*)) ".." "src"))
+;; peer runs re-enter through this launcher in a child process
+(aset (.-env js/process) "ITONAMI_AGENT_BIN" (fs/realpathSync nbb.core/*file*))
+
+(require '[itonami.agent.main :as main])
+(apply (resolve (quote itonami.agent.main/-main)) *command-line-args*)

@@ -1,0 +1,307 @@
+(ns itonami.agent.main
+  "itonami-agent — a Hermes-compatible agent written in kotoba.
+
+  Hermes-compatible surface (same profile homes, same files):
+    itonami-agent [-p P] -z PROMPT [-m MODEL] [--provider P] [-t toolsets]
+    itonami-agent [-p P] chat
+    itonami-agent [-p P] cron list | create <schedule> [prompt] [--name n --script s --deliver d]
+                              | run <id> | tick [--force] | runs [--limit n] | status
+    itonami-agent profile list | show <p>
+
+  itonami layer:
+    itonami-agent profile itonamify <p>|--all [--dry-run]   write itonami.edn (additive)
+    itonami-agent profile adopt <p>                         itonami ticks this profile's cron; Hermes stops
+    itonami-agent profile release <p>                       hand cron back to Hermes
+    itonami-agent profile bundle <p>                        print the bundle CID and file list
+    itonami-agent gateway run [--interval 60]               tick every adopted profile (resident)
+    itonami-agent peer id | serve [--port 7420 --url U --max-runs 2]
+                       | add <url> [--did D --trust] | trust <did> | list
+                       | run -p P -z PROMPT                  run one turn on a trusted peer
+
+  -z prints only the final text (exit 0), or `itonami-agent -z: <reason>` on
+  stderr with exit 1, as `hermes -z` does."
+  (:require [clojure.string :as str]
+            [promesa.core :as p]
+            [itonami.agent.host :as h]
+            [itonami.agent.profile :as profile]
+            [itonami.agent.loop :as agent-loop]
+            [itonami.agent.cron :as cron]
+            [itonami.agent.p2p :as p2p]
+            ["node:readline" :as readline]))
+
+(defn- parse-args
+  "Hermes-style: -p/--profile anywhere, flags with values, the rest positional."
+  [args]
+  (loop [[a & more] args opts {} pos []]
+    (cond
+      (nil? a) [opts pos]
+      (#{"-p" "--profile"} a) (recur (rest more) (assoc opts :profile (first more)) pos)
+      (#{"-z" "--oneshot"} a) (recur (rest more) (assoc opts :oneshot (first more)) pos)
+      (#{"-m" "--model"} a) (recur (rest more) (assoc opts :model (first more)) pos)
+      (= "--provider" a) (recur (rest more) (assoc opts :provider (first more)) pos)
+      (#{"-t" "--toolsets"} a) (recur (rest more) (assoc opts :toolsets (str/split (first more) #",")) pos)
+      (str/starts-with? a "--")
+      (let [k (keyword (subs a 2))]
+        (if (or (nil? (first more)) (str/starts-with? (first more) "-"))
+          (recur more (assoc opts k true) pos)
+          (recur (rest more) (assoc opts k (first more)) pos)))
+      :else (recur more opts (conj pos a)))))
+
+(defn- die [code msg] (binding [*print-fn* *print-err-fn*] (println msg)) (js/process.exit code))
+
+(defn- executor [opts]
+  (p2p/placement-executor {:origin-url (:origin opts) :force-peer? (:peer opts)}))
+
+(defn- log-event [e]
+  (binding [*print-fn* *print-err-fn*]
+    (println (str "[itonami-agent] " (name (:event e)) " "
+                  (pr-str (dissoc e :event :content))))))
+
+(defn- run-opts [opts]
+  (cond-> {:model (:model opts) :provider (:provider opts) :pinned? (boolean (:model opts))
+           :toolsets (:toolsets opts) :platform "cli" :load-context? true :cwd (js/process.cwd)}
+    (:verbose opts) (assoc :on-event log-event)))
+
+;; ---------------------------------------------------------------- -z / chat
+
+(defn oneshot [opts]
+  (p/let [prof (profile/load-profile (:profile opts))
+          r ((executor opts) prof (:oneshot opts) (run-opts opts))]
+    (if (and (= "completed" (:exit-reason r)) (not (str/blank? (:final r))))
+      (do (println (:final r))
+          (when (:verbose opts)
+            (binding [*print-fn* *print-err-fn*]
+              (println (str "[itonami-agent] " (:provider r) "/" (:model r) " turns=" (:turns r)
+                            (when (:peer r) (str " peer=" (:peer r))))))))
+      (die 1 (str "itonami-agent -z: " (:exit-reason r)
+                  (when-let [e (get-in r [:error :error])] (str ": " e)))))))
+
+(defn chat [opts]
+  (let [prof (profile/load-profile (:profile opts))
+        rl (readline/createInterface #js {:input js/process.stdin :output js/process.stdout})
+        history (atom nil)]
+    (println (str "itonami-agent · profile " (:name prof) " · /exit to quit"))
+    (letfn [(ask []
+              (.question rl "> "
+                         (fn [line]
+                           (if (or (nil? line) (#{"/exit" "/quit"} (str/trim line)))
+                             (.close rl)
+                             (let [prompt (if @history
+                                            (str "Conversation so far:\n" @history "\n\nUser: " line)
+                                            line)]
+                               (-> ((executor opts) prof prompt (run-opts opts))
+                                   (p/then (fn [r]
+                                             (println (or (:final r) (str "[" (:exit-reason r) "] " (get-in r [:error :error]))))
+                                             (swap! history #(str % "\nUser: " line "\nAssistant: " (:final r)))
+                                             (ask)))))))))]
+      (ask))))
+
+;; ---------------------------------------------------------------- cron
+
+(defn- print-job [j]
+  (println (str "  " (get j "id") " [" (if (cron/active? j) "active" (or (get j "state") "paused")) "]"))
+  (doseq [[k v] [["Name" (get j "name")]
+                 ["Schedule" (or (get j "schedule_display") (get-in j ["schedule" "display"]))]
+                 ["Repeat" (let [{:strs [times completed]} (get j "repeat")] (if times (str completed "/" times) "∞"))]
+                 ["Next run" (get j "next_run_at")]
+                 ["Deliver" (get j "deliver")]
+                 ["Script" (get j "script")]
+                 ["Workdir" (get j "workdir")]
+                 ["Last run" (when (get j "last_run_at") (str (get j "last_run_at") "  " (get j "last_status")))]]
+          :when v]
+    (println (str "    " (.padEnd (str k ":") 11) v)))
+  (println))
+
+(defn cron-cmd [opts [sub & args]]
+  (let [prof (profile/load-profile (:profile opts))
+        home (:home prof)]
+    (case sub
+      ("list" nil)
+      (do (println (str "Scheduled jobs · profile " (:name prof) " · scheduler " (name (cron/scheduler-of prof))))
+          (println)
+          (doseq [j (cron/read-jobs home) :when (or (:all opts) (cron/active? j))] (print-job j)))
+
+      ("create" "add")
+      (let [[schedule prompt] args
+            j (cron/new-job {:schedule schedule :prompt prompt :name (:name opts) :script (:script opts)
+                             :deliver (:deliver opts) :model (:model opts) :provider (:provider opts)
+                             :toolsets (:toolsets opts) :workdir (:workdir opts)})]
+        (cron/write-jobs! home (conj (cron/read-jobs home) j))
+        (print-job j))
+
+      "run"
+      (let [j (or (cron/find-job home (first args)) (die 2 (str "no such job: " (first args))))]
+        (p/let [r (cron/run-job prof j {:executor (executor opts) :manual? true})]
+          (println (str "  Ran now: " (if (= "error" (:status r)) "failed." "succeeded.")))
+          (println (str "  Output: " (:output-file r)))
+          (when (= "error" (:status r)) (js/process.exit 1))))
+
+      "tick"
+      (p/let [r (cron/tick prof {:force? (:force opts) :executor (executor opts)})]
+        (if (:skipped r)
+          (println (str "tick skipped: " (:skipped r)))
+          (doseq [x r] (println (str (:job x) "  " (:status x) "  " (:output-file x)))))
+        (when (and (sequential? r) (some #(= "error" (:status %)) r)) (js/process.exit 1)))
+
+      ("runs" "history")
+      (let [f (h/join home "cron" "itonami-runs.jsonl")
+            rows (if (h/file? f) (map h/json-parse (remove str/blank? (str/split-lines (h/slurp f)))) [])]
+        (doseq [r (take-last (js/parseInt (or (:limit opts) "20") 10) rows)]
+          (println (str (.padEnd (str (get r "status")) 9) "  job=" (get r "job_id") "  " (get r "ts")
+                        "  " (get r "provider") "/" (get r "model")
+                        (when (get r "peer") (str "  peer=" (get r "peer")))))))
+
+      "status"
+      (let [hb (h/join home "cron" "ticker_heartbeat")]
+        (println (str "scheduler: " (name (cron/scheduler-of prof))))
+        (println (str "last itonami tick: " (if (h/file? hb) (h/iso-local (js/Date. (* 1000 (js/parseFloat (h/slurp hb))))) "never"))))
+
+      (die 2 (str "unknown cron command: " sub)))))
+
+;; ---------------------------------------------------------------- profile
+
+(defn- set-hermes-parked!
+  "Tell Hermes' gateway to skip (parked) or serve a profile. Hermes reads the
+  marker file <home>/gateway.parked (hermes_cli/profiles.py
+  profile_is_parked) — the same marker `hermes -p X gateway stop` writes."
+  [home parked?]
+  (let [f (h/join home "gateway.parked")]
+    (if parked?
+      (h/spit f (str "parked by itonami-agent profile adopt at " (h/iso-local) "\n"))
+      (h/rm f))))
+
+(defn profile-cmd [opts [sub & args]]
+  (case sub
+    ("list" nil)
+    (do (println (str (.padEnd "Profile" 34) (.padEnd "Model" 34) (.padEnd "itonami" 9) "Scheduler"))
+        (doseq [n (cons "default" (profile/names))
+                :let [home (profile/home n)
+                      cfg (try (profile/read-yaml-file (h/join home "config.yaml")) (catch :default _ {}))
+                      m (try (profile/read-edn-file (h/join home "itonami.edn")) (catch :default _ nil))]]
+          (println (str (.padEnd n 34) (.padEnd (str (get-in cfg ["model" "default"])) 34)
+                        (.padEnd (if m "yes" "-") 9) (if m (name (get-in m [:runtime :scheduler] :hermes)) "hermes")))))
+
+    "show"
+    (let [prof (profile/load-profile (first args) {:secrets? false})]
+      (println (str "profile: " (:name prof) "\nhome: " (:home prof) "\ndescription: " (profile/description prof)
+                    "\nmodel: " (get-in prof [:config "model" "provider"]) "/" (get-in prof [:config "model" "default"])
+                    "\njobs: " (count (get-in prof [:jobs "jobs"]))
+                    "\nitonami: " (if (:itonami prof) (pr-str (select-keys (:itonami prof) [:runtime :placement :bundle])) "no"))))
+
+    "itonamify"
+    (let [targets (if (:all opts) (profile/names) [(first args)])
+          n (atom 0)]
+      (doseq [t targets]
+        (try
+          (let [prof (profile/load-profile t {:secrets? false})]
+            (if (and (:itonami prof) (not (:refresh opts)))
+              (println (str "keep    " t "  " (get-in prof [:itonami :bundle :cid])))
+              (let [m (merge (profile/default-manifest prof)
+                             (select-keys (:itonami prof) [:runtime :placement]))]
+                (when-not (:dry-run opts) (profile/write-manifest! (:home prof) m))
+                (swap! n inc)
+                (println (str (if (:dry-run opts) "would  " "wrote   ") t "  " (get-in m [:bundle :cid]))))))
+          (catch :default e (println (str "skip    " t "  " (.-message e))))))
+      (println (str @n " profile(s) " (if (:dry-run opts) "would be " "") "itonamified")))
+
+    "bundle"
+    (let [prof (profile/load-profile (first args) {:secrets? false})
+          files (profile/bundle-files (:home prof) {:skills (get-in prof [:itonami :bundle :skills])})]
+      (println (profile/bundle-cid files))
+      (doseq [[path sha] (profile/bundle-manifest files)] (println (str "  " (subs sha 0 12) "  " path))))
+
+    "adopt"
+    (let [prof (profile/load-profile (first args) {:secrets? false})
+          m (or (:itonami prof) (profile/default-manifest prof))
+          m (assoc-in m [:runtime :scheduler] :itonami)]
+      (profile/write-manifest! (:home prof) m)
+      (set-hermes-parked! (:home prof) true)
+      (profile/refresh-bundle-cid (:home prof))
+      (println (str "adopted " (:name prof) ": itonami-agent ticks its cron; Hermes skips it (gateway.parked marker)")))
+
+    "release"
+    (let [prof (profile/load-profile (first args) {:secrets? false})]
+      (when (:itonami prof)
+        (profile/write-manifest! (:home prof) (assoc-in (:itonami prof) [:runtime :scheduler] :hermes)))
+      (set-hermes-parked! (:home prof) false)
+      (println (str "released " (:name prof) ": Hermes ticks its cron again")))
+
+    (die 2 (str "unknown profile command: " sub))))
+
+;; ---------------------------------------------------------------- gateway
+
+(defn gateway-run [opts]
+  (let [interval (* 1000 (js/parseInt (or (:interval opts) "60") 10))
+        cycle (fn cycle []
+                (let [adopted (filter (fn [n] (= :itonami (get-in (try (profile/read-edn-file (h/join (profile/home n) "itonami.edn"))
+                                                                         (catch :default _ nil))
+                                                                       [:runtime :scheduler])))
+                                      (profile/names))]
+                  (-> (p/loop [[n & more] adopted]
+                        (when n
+                          (p/let [r (-> (cron/tick (profile/load-profile n) {:executor (executor opts)})
+                                        (p/catch (fn [e] {:skipped (.-message e)})))]
+                            (when (and (sequential? r) (seq r))
+                              (println (str (h/iso-local) " " n " " (str/join ", " (map #(str (:job %) "=" (:status %)) r)))))
+                            (p/recur more))))
+                      (p/finally (fn [] (js/setTimeout cycle interval))))))]
+    (println (str "itonami-agent gateway: ticking adopted profiles every " (/ interval 1000) "s"))
+    (h/spit (h/join (p2p/itonami-dir) "gateway.pid") (str (.-pid js/process)))
+    (cycle)))
+
+;; ---------------------------------------------------------------- peer
+
+(defn peer-cmd [opts [sub & args]]
+  (case sub
+    "id" (println (:did (p2p/node-key)))
+
+    "serve"
+    (p/let [{:keys [did port]} (p2p/serve {:port (some-> (:port opts) (js/parseInt 10))
+                                           :host (:host opts)
+                                           :public-url (:url opts)
+                                           :max-runs (some-> (:max-runs opts) (js/parseInt 10))})]
+      (println (str "itonami-agent peer " did " listening on :" port " (" p2p/protocol ")")))
+
+    "add" (do (p2p/add-peer! {:url (first args) :did (:did opts) :trust? (:trust opts)})
+              (println (str "added " (first args) (when (:trust opts) (str " (trusted " (:did opts) ")")))))
+
+    "trust" (let [m (p2p/read-peers)] (p2p/write-peers! (update m :trusted conj (first args))) (println (str "trusted " (first args))))
+
+    "list"
+    (p/let [infos (p2p/discover)
+            {:keys [trusted]} (p2p/read-peers)]
+      (doseq [i infos]
+        (println (str (.padEnd (str (:url i)) 32)
+                      (if (:error i) (str "unreachable: " (:error i))
+                          (str (:did i) (if (contains? trusted (:did i)) "  trusted" "  untrusted")
+                               "  load " (get i "load") "/" (get i "max_runs")
+                               "  rails " (str/join "," (get i "rails"))
+                               (when (get i "murakumo_did") (str "  murakumo " (get i "murakumo_did")))))))))
+
+    "run" (oneshot (assoc opts :peer true))
+
+    "exec" (p2p/exec-from-stdin)
+
+    (die 2 (str "unknown peer command: " sub))))
+
+;; ---------------------------------------------------------------- main
+
+(defn -main [& argv]
+  (let [[opts pos] (parse-args argv)]
+    (when (and (:profile opts) (not= "default" (:profile opts)) (not (profile/valid-name? (:profile opts))))
+      (die 2 (str "invalid profile name: " (:profile opts))))
+    (-> (p/do
+          (cond
+            (and (:oneshot opts) (not= "peer" (first pos))) (oneshot opts)
+            :else
+            (case (first pos)
+              "chat" (chat opts)
+              "cron" (cron-cmd opts (rest pos))
+              "profile" (profile-cmd opts (rest pos))
+              "gateway" (if (= "run" (second pos)) (gateway-run opts) (die 2 "usage: itonami-agent gateway run"))
+              "peer" (peer-cmd opts (rest pos))
+              ("help" "--help" nil) (println (:doc (meta #'itonami.agent.main/-main)) (-> 'itonami.agent.main find-ns meta :doc))
+              (die 2 (str "unknown command: " (first pos))))))
+        (p/catch (fn [e]
+                   (when (h/env "ITONAMI_DEBUG") (binding [*print-fn* *print-err-fn*] (println (.-stack e)) (println (ex-data e))))
+                   (die 1 (str "itonami-agent: " (.-message e))))))))

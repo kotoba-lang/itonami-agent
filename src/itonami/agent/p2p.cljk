@@ -1,0 +1,525 @@
+(ns itonami.agent.p2p
+  "Peer-to-peer execution of agent turns.
+
+  Every itonami-agent node is the same program in `peer serve` mode: it can
+  ask another node to run a turn and it can run turns for others. There is no
+  coordinator.
+
+  Identity   each node holds an ed25519 key (~/.itonami/node/key.json) and is
+             named by its did:key. If the node is also a murakumo fleet node,
+             MURAKUMO_NODE_DID is advertised beside it.
+  Trust      ~/.itonami/peers.edn {:trusted #{did ...} :peers [{:url ..}]}.
+             Only trusted DIDs may fetch bundles or submit runs. Unknown peers
+             are learned by gossip (one hop of /peer) but never trusted
+             implicitly.
+  Envelope   {payload <json string> did <did:key> sig <base64 ed25519>}; the
+             payload carries ts + nonce (±120 s window, nonce not reused).
+  Bundles    a profile crosses as its content-addressed bundle (profile/
+             bundle-files): SOUL, config minus host-local blocks, job
+             definitions, scripts. The executing peer pulls it from the
+             requester by CID and verifies the hash. Secrets never cross.
+  Execution  the peer materializes the bundle under ~/.itonami/peer-runs/<cid>/,
+             runs the turn with tool writes confined to that copy, pays
+             inference with its own rail (murakumo by default), and returns a
+             signed receipt plus the files the run wrote under workspace/.
+             The requester verifies the signature and applies those files to
+             its own workspace.
+
+  What this is not (ADR-2609242300 conditions still open): process isolation.
+  `terminal` on a peer is a real shell on that peer. Trust is the boundary,
+  which is why runs are refused from anyone not in :trusted."
+  (:require [clojure.string :as str]
+            [cljs.reader :as reader]
+            [promesa.core :as p]
+            [itonami.agent.host :as h]
+            [itonami.agent.profile :as profile]
+            [itonami.agent.loop :as agent-loop]
+            ["node:crypto" :as crypto]
+            ["node:child_process" :as cp]
+            ["node:http" :as http]))
+
+(def protocol "itonami-agent-p2p/1")
+(def default-port 7420)
+
+(defn itonami-dir [] (h/expand (or (h/env "ITONAMI_DIR") "~/.itonami")))
+
+;; ---------------------------------------------------------------- base58 / did:key
+
+(def ^:private b58 "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz")
+
+(defn base58btc [^js bytes]
+  (let [digits (loop [i 0 digits [0]]
+                 (if (>= i (.-length bytes))
+                   digits
+                   (let [[digits carry] (reduce (fn [[ds carry] d]
+                                                  (let [x (+ (* d 256) carry)]
+                                                    [(conj ds (mod x 58)) (quot x 58)]))
+                                                [[] (aget bytes i)] digits)
+                         digits (loop [ds digits c carry] (if (pos? c) (recur (conj ds (mod c 58)) (quot c 58)) ds))]
+                     (recur (inc i) digits))))
+        zeros (count (take-while zero? (array-seq bytes)))]
+    (str (apply str (repeat zeros "1"))
+         (if (every? zero? (array-seq bytes)) "" (apply str (map #(.charAt b58 %) (drop-while zero? (reverse digits))))))))
+
+(defn unbase58btc [s]
+  (let [n (let [big58 (js/BigInt 58)] (reduce (fn [acc c] (+ (* acc big58) (js/BigInt (.indexOf b58 c)))) (js/BigInt 0) s))
+        zero? (= n (js/BigInt 0))
+        hex (.toString n 16)
+        hex (if (odd? (count hex)) (str "0" hex) hex)
+        zeros (count (take-while #(= % \1) s))]
+    (js/Buffer.concat #js [(js/Buffer.alloc zeros) (if zero? (js/Buffer.alloc 0) (js/Buffer.from hex "hex"))])))
+
+(defn- spki->raw [^js der] (.subarray der (- (.-length der) 32)))
+(def ^:private spki-prefix (js/Buffer.from "302a300506032b6570032100" "hex"))
+
+(defn pub->did [^js raw]
+  (str "did:key:z" (base58btc (js/Buffer.concat #js [(js/Buffer.from #js [0xed 0x01]) raw]))))
+
+(defn did->public-key [did]
+  (when-let [[_ z] (re-matches #"^did:key:z(.+)$" (str did))]
+    (let [b (unbase58btc z)]
+      (when (and (= 34 (.-length b)) (= 0xed (aget b 0)) (= 0x01 (aget b 1)))
+        (crypto/createPublicKey #js {:key (js/Buffer.concat #js [spki-prefix (.subarray b 2)]) :format "der" :type "spki"})))))
+
+;; ---------------------------------------------------------------- node identity
+
+(defn node-key
+  "Load or create this node's ed25519 key. The private key never leaves
+  ~/.itonami/node/key.json (mode 0600)."
+  []
+  (let [f (h/join (itonami-dir) "node" "key.json")]
+    (when-not (h/file? f)
+      (let [kp (crypto/generateKeyPairSync "ed25519")]
+        (h/spit f (h/json-str {"public" (.toString (.export (.-publicKey kp) #js {:type "spki" :format "der"}) "base64")
+                               "private" (.toString (.export (.-privateKey kp) #js {:type "pkcs8" :format "der"}) "base64")})
+                {:mode 0600})))
+    (let [{:strs [public private]} (h/json-parse (h/slurp f))
+          pub-der (js/Buffer.from public "base64")]
+      {:did (pub->did (spki->raw pub-der))
+       :private (crypto/createPrivateKey #js {:key (js/Buffer.from private "base64") :format "der" :type "pkcs8"})})))
+
+(defn sign-envelope [{:keys [did private]} payload-map]
+  (let [payload (h/json-str (assoc payload-map "ts" (h/now-ms) "nonce" (h/random-hex 12) "protocol" protocol))]
+    {"payload" payload
+     "did" did
+     "sig" (.toString (crypto/sign nil (js/Buffer.from payload) private) "base64")}))
+
+(def ^:private seen-nonces (atom {}))
+
+(defn open-envelope
+  "Verify an envelope. Returns {:did :payload} or {:error reason}."
+  [{:strs [payload did sig]} {:keys [trusted]}]
+  (let [k (did->public-key did)]
+    (cond
+      (nil? k) {:error "bad did"}
+      (not (try (crypto/verify nil (js/Buffer.from (str payload)) k (js/Buffer.from (str sig) "base64")) (catch :default _ false)))
+      {:error "bad signature"}
+      :else
+      (let [pl (h/json-parse payload)
+            age (js/Math.abs (- (h/now-ms) (get pl "ts" 0)))]
+        (cond
+          (> age 120000) {:error "stale envelope"}
+          (contains? @seen-nonces (get pl "nonce")) {:error "replayed nonce"}
+          (and trusted (not (contains? trusted did))) {:error (str "untrusted peer " did)}
+          :else (do (swap! seen-nonces (fn [m] (into {} (filter #(< (- (h/now-ms) (val %)) 300000)) (assoc m (get pl "nonce") (h/now-ms)))))
+                    {:did did :payload pl}))))))
+
+;; ---------------------------------------------------------------- peers.edn
+
+(defn peers-file [] (h/join (itonami-dir) "peers.edn"))
+
+(defn read-peers []
+  (let [f (peers-file)]
+    (merge {:trusted #{} :peers []} (when (h/file? f) (reader/read-string (h/slurp f))))))
+
+(defn write-peers! [m]
+  (h/spit-atomic (peers-file)
+                 (str ";; itonami-agent peers. :trusted DIDs may fetch bundles and run turns here,\n"
+                      ";; and are the only peers this node will send runs to.\n"
+                      (pr-str (-> m (update :trusted set) (update :peers #(vec (distinct %))))) "\n")))
+
+(defn add-peer! [{:keys [url did trust?]}]
+  (let [m (read-peers)]
+    (write-peers! (cond-> m
+                    url (update :peers conj (cond-> {:url url} did (assoc :did did)))
+                    (and did trust?) (update :trusted conj did)))))
+
+;; ---------------------------------------------------------------- local profiles on offer
+
+(defn local-itonami-profiles []
+  (vec (for [n (profile/names)
+             :let [m (try (profile/read-edn-file (h/join (profile/home n) "itonami.edn")) (catch :default _ nil))]
+             :when m]
+         {"name" n "cid" (get-in m [:bundle :cid])})))
+
+(defn- rails-available
+  "Which inference rails this node can pay for — names only, never values."
+  []
+  (vec (for [[rail k] [["murakumo" "MURAKUMO_API_TOKEN"] ["kotoba" "KOTOBA_API_TOKEN"] ["openrouter" "OPENROUTER_API_KEY"]]
+             :when (or (h/env k) (contains? (profile/parse-dotenv (let [f (h/join (itonami-dir) "peer.env")] (when (h/file? f) (h/slurp f)))) k))]
+         rail)))
+
+;; ---------------------------------------------------------------- HTTP plumbing
+
+(defn- read-body [^js req]
+  (js/Promise. (fn [resolve reject]
+                 (let [chunks #js []]
+                   (.on req "data" #(.push chunks %))
+                   (.on req "end" #(resolve (.toString (js/Buffer.concat chunks) "utf8")))
+                   (.on req "error" reject)))))
+
+(defn- reply [^js res status m]
+  (.writeHead res status #js {"Content-Type" "application/json"})
+  (.end res (h/json-str m)))
+
+(defn http-json
+  "fetch -> {:status :body (parsed or nil) :text}"
+  [url {:keys [method body headers timeout-s]}]
+  (let [ctrl (js/AbortController.)
+        t (js/setTimeout #(.abort ctrl) (* 1000 (or timeout-s 30)))]
+    (-> (js/fetch url (clj->js (cond-> {:method (or method "GET") :headers (merge {"Content-Type" "application/json"} headers)
+                                        :signal (.-signal ctrl)}
+                                 body (assoc :body body))))
+        (p/then (fn [^js r] (p/let [txt (.text r)]
+                              {:status (.-status r) :text txt
+                               :body (try (h/json-parse txt) (catch :default _ nil))})))
+        (p/finally #(js/clearTimeout t)))))
+
+(defn auth-header [node m] {"X-Itonami-Envelope" (js/encodeURIComponent (h/json-str (sign-envelope node m)))})
+
+(defn- header-envelope [^js req]
+  (when-let [v (aget (.-headers req) "x-itonami-envelope")]
+    (try (h/json-parse (js/decodeURIComponent v)) (catch :default _ nil))))
+
+;; ---------------------------------------------------------------- bundle exchange
+
+(defn bundle-cache-dir [cid] (h/join (itonami-dir) "peer-runs" cid))
+
+(defn local-bundle
+  "The bundle of a local itonami profile if its current CID is `cid`."
+  [cid]
+  (some (fn [{:strs [name]}]
+          (let [home (profile/home name)
+                m (profile/read-edn-file (h/join home "itonami.edn"))
+                files (profile/bundle-files home {:skills (get-in m [:bundle :skills])})]
+            (when (= cid (profile/bundle-cid files)) {"name" name "files" files})))
+        (local-itonami-profiles)))
+
+(defn fetch-bundle
+  "Pull a bundle by CID from origin and verify it. Resolves to files map."
+  [node origin-url cid]
+  (p/let [r (http-json (str origin-url "/itonami/v1/bundle/" cid) {:headers (auth-header node {"get" cid}) :timeout-s 60})]
+    (let [files (get-in r [:body "files"])]
+      (cond
+        (not= 200 (:status r)) (throw (ex-info (str "bundle fetch " (:status r) ": " (subs (str (:text r)) 0 200)) {}))
+        (not (profile/verify-bundle cid files)) (throw (ex-info (str "bundle " cid " failed hash verification") {}))
+        :else files))))
+
+(defn materialize-bundle!
+  "Write files under ~/.itonami/peer-runs/<cid>/home and return that home."
+  [cid files]
+  (let [home (h/join (bundle-cache-dir cid) "home")]
+    (when-not (h/file? (h/join home ".complete"))
+      (h/rm home)
+      (doseq [[rel content] files]
+        (when (or (str/includes? rel "..") (str/starts-with? rel "/"))
+          (throw (ex-info (str "unsafe path in bundle: " rel) {})))
+        (h/spit (h/join home rel) content))
+      (h/spit (h/join home ".complete") cid))
+    home))
+
+;; ---------------------------------------------------------------- serve
+
+(defn- peer-env
+  "Env for runs this node executes for others: its own process env plus
+  ~/.itonami/peer.env. The requester's secrets are never present."
+  []
+  (merge (h/process-env)
+         (let [f (h/join (itonami-dir) "peer.env")] (when (h/file? f) (profile/parse-dotenv (h/slurp f))))))
+
+(defn ensure-rail
+  "Put the named inference rail (murakumo) at the end of the fallback chain
+  if the profile's config does not already name it, so a peer run always has
+  the shared rail to fall back to."
+  [config rail]
+  (if (or (nil? rail) (= rail (get-in config ["model" "provider"]))
+          (some #(= rail (get % "provider")) (get config "fallback_providers")))
+    config
+    (update config "fallback_providers" (fnil conj [])
+            {"provider" rail "model" (if (= rail "murakumo") "murakumo/free" "default")})))
+
+(defn rebase-paths
+  "The requester's prompt and SOUL name paths in ITS profile home
+  (/Users/x/.hermes/profiles/p/workspace/...). On the peer those become the
+  run's own copy: <origin-home>/workspace -> the run workspace (whose files
+  travel back), <origin-home> -> the materialized bundle home."
+  [text {:keys [origin-home profile ws home]}]
+  (if (or (nil? text) (nil? origin-home))
+    text
+    (let [tilde (str "~/.hermes/profiles/" profile)]
+      (reduce (fn [t [from to]] (str/replace t from to))
+              text
+              [[(str origin-home "/workspace") ws] [(str tilde "/workspace") ws]
+               [origin-home home] [tilde home]]))))
+
+(defn execute-for-peer
+  "Run a turn this node accepted. Resolves to the signed result envelope map."
+  [node {:strs [profile cid origin prompt opts origin_home]} requester-did]
+  (p/let [inline (get-in {"files" (get opts "files")} ["files"])
+          files (cond
+                  (and inline (profile/verify-bundle cid inline)) inline
+                  inline (throw (ex-info (str "inline bundle failed hash verification for " cid) {}))
+                  :else (if-let [b (local-bundle cid)] (get b "files") (fetch-bundle node origin cid)))
+          home (materialize-bundle! cid files)
+          run-id (h/random-hex 8)
+          ws (h/join (bundle-cache-dir cid) "runs" run-id "workspace")
+          _ (h/mkdirs ws)
+          paths {:origin-home origin_home :profile profile :ws ws :home home}
+          prof (-> (profile/load-profile* home profile)
+                   (assoc :env (peer-env))
+                   (update :soul rebase-paths paths)
+                   (update :config ensure-rail (get opts "inference_rail" "murakumo")))
+          r (agent-loop/run prof (rebase-paths prompt paths) {:platform (get opts "platform" "peer")
+                                         :toolsets (get opts "toolsets")
+                                         :model (get opts "model") :provider (get opts "provider")
+                                         :pinned? (get opts "pinned")
+                                         :cwd ws :roots [ws (h/join home "workspace")]})
+          writes (into (sorted-map)
+                       (for [abs (distinct (:writes r))
+                             :when (and (str/starts-with? abs (str ws "/")) (h/file? abs))]
+                         [(str "workspace/" (subs abs (inc (count ws)))) (h/slurp abs)]))
+          result {"run_id" run-id "profile" profile "cid" cid "requester" requester-did
+                  "final" (:final r) "exit_reason" (:exit-reason r) "turns" (:turns r)
+                  "usage" (:usage r) "provider" (:provider r) "model" (:model r)
+                  "attempts" (mapv #(into {} (map (fn [[k v]] [(name k) v]) %)) (:attempts r))
+                  "error" (get-in r [:error :error])
+                  "writes" writes
+                  "prompt_sha256" (h/sha256-hex prompt)}
+          result (assoc result "result_sha256" (h/sha256-hex (h/json-str (dissoc result "result_sha256"))))]
+    (sign-envelope node result)))
+
+(defn execute-in-child
+  "Run execute-for-peer in a separate `itonami-agent peer exec` process, so a
+  long tool call (a blocking shell command) never stalls this node's server,
+  and a crashing run cannot take the server down. Resolves to the signed
+  result envelope."
+  [payload requester-did]
+  (let [bin (or (h/env "ITONAMI_AGENT_BIN") (throw (ex-info "ITONAMI_AGENT_BIN not set (start through bin/itonami-agent)" {})))]
+    (js/Promise.
+     (fn [resolve reject]
+       (let [child (cp/spawn bin #js ["peer" "exec"] #js {:stdio #js ["pipe" "pipe" "pipe"]})
+             out #js [] err #js []]
+         (.on (.-stdout child) "data" #(.push out %))
+         (.on (.-stderr child) "data" #(.push err %))
+         (.on child "error" reject)
+         (.on child "close"
+              (fn [code]
+                (let [o (.toString (js/Buffer.concat out) "utf8")]
+                  (if (zero? code)
+                    (try (resolve (h/json-parse (last (str/split-lines (str/trim o)))))
+                         (catch :default e (reject e)))
+                    (reject (js/Error. (str "peer exec exited " code ": "
+                                            (subs (.toString (js/Buffer.concat err) "utf8") 0 400))))))))
+         (.end (.-stdin child) (h/json-str {"payload" payload "requester" requester-did})))))))
+
+(defn exec-from-stdin
+  "Child side of execute-in-child."
+  []
+  (p/let [input (js/Promise. (fn [resolve]
+                               (let [chunks #js []]
+                                 (.on js/process.stdin "data" #(.push chunks %))
+                                 (.on js/process.stdin "end" #(resolve (.toString (js/Buffer.concat chunks) "utf8"))))))
+          {:strs [payload requester]} (h/json-parse input)
+          env (execute-for-peer (node-key) payload requester)]
+    (println (h/json-str env))))
+
+(def ^:private active-runs (atom 0))
+(def ^:private runs (atom {}))
+
+(defn serve
+  "Start the peer server. Resolves to the http server."
+  [{:keys [port host max-runs public-url]}]
+  (let [node (node-key)
+        port (or port default-port)
+        max-runs (or max-runs 2)
+        server
+        (http/createServer
+         (fn [^js req ^js res]
+           (let [url (.-url req) method (.-method req)]
+             (-> (cond
+                   (and (= method "GET") (= url "/itonami/v1/peer"))
+                   (let [{:keys [peers]} (read-peers)]
+                     (reply res 200 (sign-envelope node {"did" (:did node) "url" public-url
+                                                         "murakumo_did" (h/env "MURAKUMO_NODE_DID")
+                                                         "load" @active-runs "max_runs" max-runs
+                                                         "rails" (rails-available)
+                                                         "profiles" (local-itonami-profiles)
+                                                         "peers" (mapv :url peers)})))
+
+                   (and (= method "GET") (str/starts-with? url "/itonami/v1/bundle/"))
+                   (let [cid (subs url (count "/itonami/v1/bundle/"))
+                         env (open-envelope (header-envelope req) (read-peers))]
+                     (cond
+                       (:error env) (reply res 403 {"error" (:error env)})
+                       (not= cid (get-in env [:payload "get"])) (reply res 403 {"error" "envelope names another cid"})
+                       :else (if-let [b (local-bundle cid)]
+                               (reply res 200 {"cid" cid "files" (get b "files")})
+                               (reply res 404 {"error" "no such bundle here"}))))
+
+                   (and (= method "POST") (= url "/itonami/v1/run"))
+                   (p/let [body (read-body req)
+                           env (open-envelope (try (h/json-parse body) (catch :default _ {})) (read-peers))]
+                     (cond
+                       (:error env) (reply res 403 {"error" (:error env)})
+                       (>= @active-runs max-runs) (reply res 429 {"error" "busy" "load" @active-runs "max_runs" max-runs})
+                       :else
+                       ;; accept, answer 202 at once, run in the background; the
+                       ;; requester polls. No HTTP request is held for a whole turn.
+                       (let [run-id (h/random-hex 8)]
+                         (swap! active-runs inc)
+                         (swap! runs assoc run-id {:status "running" :requester (:did env) :started (h/now-ms)})
+                         (println (str (h/iso-local) " run " run-id " accepted from " (:did env)
+                                       " profile=" (get-in env [:payload "profile"]) " cid=" (get-in env [:payload "cid"])))
+                         (-> (execute-in-child (:payload env) (:did env))
+                             (p/then (fn [e]
+                                       (println (str (h/iso-local) " run " run-id " done"))
+                                       (swap! runs assoc-in [run-id] {:status "done" :requester (:did env) :envelope e})))
+                             (p/catch (fn [e]
+                                        (println (str (h/iso-local) " run " run-id " failed: " (.-message e)))
+                                        (swap! runs assoc-in [run-id] {:status "failed" :requester (:did env) :error (.-message e)})))
+                             (p/finally #(swap! active-runs dec)))
+                         (reply res 202 (sign-envelope node {"run_id" run-id "status" "running"})))))
+
+                   (and (= method "GET") (str/starts-with? url "/itonami/v1/run/"))
+                   (let [run-id (subs url (count "/itonami/v1/run/"))
+                         env (open-envelope (header-envelope req) (read-peers))
+                         r (get @runs run-id)]
+                     (cond
+                       (:error env) (reply res 403 {"error" (:error env)})
+                       (not= run-id (get-in env [:payload "poll"])) (reply res 403 {"error" "envelope names another run"})
+                       (nil? r) (reply res 404 {"error" "no such run"})
+                       (not= (:requester r) (:did env)) (reply res 403 {"error" "not your run"})
+                       (= "running" (:status r)) (reply res 202 {"run_id" run-id "status" "running"})
+                       (= "failed" (:status r)) (do (swap! runs dissoc run-id) (reply res 500 {"error" (:error r)}))
+                       :else (do (swap! runs dissoc run-id) (reply res 200 (:envelope r)))))
+
+                   :else (reply res 404 {"error" "not found" "protocol" protocol}))
+                 (p/catch (fn [e] (try (reply res 500 {"error" (.-message e)}) (catch :default _ nil))))))))]
+    (js/Promise. (fn [resolve]
+                   (.listen server port (or host "0.0.0.0") #(resolve {:server server :did (:did node) :port port}))))))
+
+;; ---------------------------------------------------------------- client
+
+(defn peer-info
+  "GET /peer from url; verifies the envelope (signature only, trust checked by caller)."
+  [url]
+  (-> (http-json (str url "/itonami/v1/peer") {:timeout-s 10})
+      (p/then (fn [{:keys [status body]}]
+                (if (= 200 status)
+                  (let [env (open-envelope body {})]
+                    (if (:error env) {:url url :error (:error env)} (assoc (:payload env) :url url :did (:did env))))
+                  {:url url :error (str "http " status)})))
+      (p/catch (fn [e] {:url url :error (.-message e)}))))
+
+(defn discover
+  "Known peers plus one gossip hop. Resolves to peer-info maps (reachable or not)."
+  []
+  (p/let [{:keys [peers]} (read-peers)
+          first-hop (p/all (map #(peer-info (:url %)) peers))
+          known (set (map :url peers))
+          more (distinct (remove known (mapcat #(get % "peers") first-hop)))
+          second-hop (p/all (map peer-info more))]
+    (vec (concat first-hop second-hop))))
+
+(defn pick-peer
+  "Trusted, reachable, not full; prefer a peer that already holds cid, then
+  lowest load."
+  [infos cid]
+  (let [{:keys [trusted]} (read-peers)
+        me (:did (node-key))]
+    (->> infos
+         (filter #(and (not (:error %)) (contains? trusted (:did %)) (not= me (:did %))
+                       (< (get % "load" 0) (get % "max_runs" 1))))
+         (sort-by (fn [i] [(if (some #(= cid (get % "cid")) (get i "profiles")) 0 1) (get i "load" 0)]))
+         first)))
+
+(defn remote-run
+  "Ask peer (an info map) to run prompt for local profile prof. Resolves to a
+  loop-result-shaped map with :peer and :receipt, writes applied locally."
+  [prof prompt opts peer {:keys [origin-url]}]
+  (let [node (node-key)
+        home (:home prof)
+        m (:itonami prof)
+        files (profile/bundle-files home {:skills (get-in m [:bundle :skills])})
+        cid (profile/bundle-cid files)]
+    (p/let [sub (http-json (str (:url peer) "/itonami/v1/run")
+                           {:method "POST" :timeout-s 60
+                            :body (h/json-str (sign-envelope node {"profile" (:name prof) "cid" cid "origin" origin-url
+                                                                   "origin_home" home
+                                                                   "prompt" prompt
+                                                                   "opts" {"toolsets" (:toolsets opts) "model" (:model opts)
+                                                                           "provider" (:provider opts) "pinned" (:pinned? opts)
+                                                                           "platform" (:platform opts)
+                                                                           "inference_rail" (some-> (get-in m [:placement :inference-rail]) name)
+                                                                           ;; no origin to pull from: ship the bundle inline (still CID-verified)
+                                                                           "files" (when-not origin-url files)}}))})
+            run-id (get-in (open-envelope (:body sub) {:trusted #{(:did peer)}}) [:payload "run_id"])
+            deadline (+ (h/now-ms) (* 1000 (+ 300 (or (get-in prof [:config "agent" "run_budget_seconds"]) 900))))
+            r (if-not (and (= 202 (:status sub)) run-id)
+                sub
+                (p/loop []
+                  (p/let [_ (p/delay 3000)
+                          r (-> (http-json (str (:url peer) "/itonami/v1/run/" run-id)
+                                           {:headers (auth-header node {"poll" run-id}) :timeout-s 30})
+                                (p/catch (fn [e] {:status 0 :text (.-message e)})))]
+                    (cond
+                      (= 200 (:status r)) r
+                      (> (h/now-ms) deadline) {:status 504 :text "peer run exceeded deadline"}
+                      (#{202 0} (:status r)) (p/recur)
+                      :else r))))]
+      (if (not= 200 (:status r))
+        {:final nil :exit-reason "peer_error" :error {:error (str (:url peer) " -> " (:status r) " " (get-in r [:body "error"] (:text r)))}
+         :peer (:did peer) :turns 0 :attempts []}
+        (let [env (open-envelope (:body r) {:trusted #{(:did peer)}})
+              pl (:payload env)]
+          (cond
+            (:error env) {:final nil :exit-reason "peer_error" :error {:error (str "result envelope: " (:error env))} :peer (:did peer) :turns 0 :attempts []}
+            (not= cid (get pl "cid")) {:final nil :exit-reason "peer_error" :error {:error "peer ran a different bundle"} :peer (:did peer) :turns 0 :attempts []}
+            :else
+            (do (doseq [[rel content] (get pl "writes")]
+                  (when (and (str/starts-with? rel "workspace/") (not (str/includes? rel "..")))
+                    (h/spit (h/join home rel) content)))
+                {:final (get pl "final") :exit-reason (get pl "exit_reason") :turns (get pl "turns")
+                 :usage (get pl "usage") :provider (get pl "provider") :model (get pl "model")
+                 :attempts (mapv #(into {} (map (fn [[k v]] [(keyword k) v]) %)) (get pl "attempts"))
+                 :error (when (get pl "error") {:error (get pl "error")})
+                 :writes (mapv #(h/join home %) (keys (get pl "writes")))
+                 :peer (:did env)
+                 :receipt {"run_id" (get pl "run_id") "peer" (:did env) "cid" cid
+                           "result_sha256" (get pl "result_sha256") "sig" (get-in r [:body "sig"])}})))))))
+
+(defn placement-executor
+  "An executor (for cron/run-job and -z) that follows itonami.edn :placement
+  :order, e.g. [:peer :local]: try a trusted peer, fall back to local. A
+  profile without itonami.edn always runs locally."
+  [{:keys [origin-url force-peer?]}]
+  (fn [prof prompt opts]
+    (let [order (if force-peer? [:peer] (get-in prof [:itonami :placement :order] [:local]))
+          cid (get-in prof [:itonami :bundle :cid])]
+      (p/loop [[step & more] order last-r nil]
+        (cond
+          (nil? step) (or last-r {:final nil :exit-reason "no_placement" :error {:error "no placement step could run the turn"} :turns 0 :attempts []})
+
+          (= step :local)
+          (p/let [r (agent-loop/run prof prompt opts)]
+            (if (and (= "provider_error" (:exit-reason r)) (seq more)) (p/recur more r) r))
+
+          (= step :peer)
+          (p/let [infos (discover)
+                  peer (pick-peer infos cid)]
+            (if-not peer
+              (p/recur more (or last-r {:final nil :exit-reason "no_peer" :error {:error "no trusted peer available"} :turns 0 :attempts []}))
+              (p/let [r (remote-run prof prompt opts peer {:origin-url origin-url})]
+                (if (and (#{"peer_error" "provider_error"} (:exit-reason r)) (seq more)) (p/recur more r) r))))
+
+          :else (p/recur more last-r))))))

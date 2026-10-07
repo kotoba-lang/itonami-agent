@@ -1,0 +1,189 @@
+(ns itonami.agent.host
+  "The effects itonami-agent performs on its host, in one place: files, paths,
+  clocks, hashing, child processes. Everything above this namespace is data
+  in, data out, so a peer that runs a turn and the host that asked for it
+  agree on what a profile is without sharing a process."
+  (:require [clojure.string :as str]
+            ["node:fs" :as fs]
+            ["node:path" :as path]
+            ["node:os" :as os]
+            ["node:crypto" :as crypto]
+            ["node:child_process" :as cp]))
+
+(defn env [k] (aget (.-env js/process) k))
+
+(defn process-env
+  "process.env as a Clojure map. (js->clj does not convert it: process.env is
+  not a plain Object.)"
+  []
+  (let [e (.-env js/process)]
+    (into {} (for [k (js/Object.keys e)] [k (aget e k)]))))
+(defn home-dir [] (os/homedir))
+(defn expand [p] (if (and p (str/starts-with? p "~")) (str (home-dir) (subs p 1)) p))
+(defn join [& parts] (apply path/join (map str parts)))
+(defn dirname [p] (path/dirname p))
+(defn basename [p] (path/basename p))
+(defn exists? [p] (and p (fs/existsSync p)))
+(defn dir? [p] (and (exists? p) (.isDirectory (fs/statSync p))))
+(defn file? [p] (and (exists? p) (.isFile (fs/statSync p))))
+(defn slurp [p] (str (fs/readFileSync p "utf8")))
+(defn slurp-bytes [p] (fs/readFileSync p))
+(defn mkdirs [p] (fs/mkdirSync p #js {:recursive true}) p)
+(defn spit
+  ([p s] (spit p s nil))
+  ([p s {:keys [mode append?]}]
+   (mkdirs (dirname p))
+   (if append?
+     (fs/appendFileSync p s)
+     (fs/writeFileSync p s (if mode #js {:mode mode} #js {})))
+   p))
+(defn spit-atomic
+  "Write through a temp file + rename, so a reader (Hermes, a peer, a fleet
+  guard) never sees half a jobs.json."
+  [p s]
+  (let [tmp (str p ".tmp-" (.-pid js/process) "-" (js/Date.now))]
+    (spit tmp s)
+    (fs/renameSync tmp p)
+    p))
+(defn ls [p] (if (dir? p) (vec (sort (js->clj (fs/readdirSync p)))) []))
+(defn mtime-ms [p] (.-mtimeMs (fs/statSync p)))
+(defn rm [p] (when (exists? p) (fs/rmSync p #js {:recursive true :force true})))
+
+(defn walk-files
+  "Relative paths of the regular files under dir, sorted, skipping names in
+  `skip?` (a predicate on the relative path)."
+  [dir skip?]
+  (letfn [(go [rel]
+            (let [abs (if (= rel "") dir (join dir rel))]
+              (mapcat (fn [n]
+                        (let [r (if (= rel "") n (str rel "/" n))
+                              a (join dir r)]
+                          (cond
+                            (skip? r) []
+                            (.isSymbolicLink (fs/lstatSync a)) []
+                            (dir? a) (go r)
+                            :else [r])))
+                      (ls abs))))]
+    (vec (sort (go "")))))
+
+;; ---------------------------------------------------------------- time
+
+(defn now-ms [] (js/Date.now))
+
+(defn- pad [n w] (.padStart (str n) w "0"))
+
+(defn tz-offset-str
+  "+09:00 style offset of the host zone at instant d."
+  [d]
+  (let [m (- (.getTimezoneOffset d))
+        s (if (neg? m) "-" "+")
+        m (js/Math.abs m)]
+    (str s (pad (quot m 60) 2) ":" (pad (mod m 60) 2))))
+
+(defn iso-local
+  "ISO-8601 with the host offset and microseconds, the way Hermes writes
+  next_run_at / last_run_at (2026-10-07T17:30:00+09:00 or with .ffffff)."
+  ([] (iso-local (js/Date.)))
+  ([d] (iso-local d false))
+  ([d micros?]
+   (str (.getFullYear d) "-" (pad (inc (.getMonth d)) 2) "-" (pad (.getDate d) 2)
+        "T" (pad (.getHours d) 2) ":" (pad (.getMinutes d) 2) ":" (pad (.getSeconds d) 2)
+        (when micros? (str "." (pad (* 1000 (.getMilliseconds d)) 6)))
+        (tz-offset-str d))))
+
+(defn stamp
+  "YYYY-MM-DD_HH-MM-SS — the cron/output file name Hermes uses."
+  ([] (stamp (js/Date.)))
+  ([d] (str (.getFullYear d) "-" (pad (inc (.getMonth d)) 2) "-" (pad (.getDate d) 2)
+            "_" (pad (.getHours d) 2) "-" (pad (.getMinutes d) 2) "-" (pad (.getSeconds d) 2))))
+
+(defn human-time
+  "YYYY-MM-DD HH:MM:SS"
+  ([] (human-time (js/Date.)))
+  ([d] (str/replace (subs (iso-local d) 0 19) "T" " ")))
+
+(defn parse-time [s] (when s (let [d (js/Date. s)] (when-not (js/isNaN (.getTime d)) d))))
+
+;; ---------------------------------------------------------------- hashing / ids
+
+(defn sha256-hex [data]
+  (-> (crypto/createHash "sha256") (.update data) (.digest "hex")))
+
+(defn sha256-bytes [data]
+  (-> (crypto/createHash "sha256") (.update data) (.digest)))
+
+(def ^:private b32-alphabet "abcdefghijklmnopqrstuvwxyz234567")
+
+(defn base32-lower
+  "RFC 4648 base32, lower case, no padding (the multibase `b` alphabet)."
+  [^js bytes]
+  (loop [i 0 bits 0 value 0 out ""]
+    (if (< i (.-length bytes))
+      (let [value (bit-or (bit-shift-left value 8) (aget bytes i))
+            bits (+ bits 8)
+            [out bits] (loop [out out bits bits]
+                         (if (>= bits 5)
+                           (recur (str out (.charAt b32-alphabet (bit-and (unsigned-bit-shift-right value (- bits 5)) 31)))
+                                  (- bits 5))
+                           [out bits]))]
+        (recur (inc i) bits (bit-and value 0xff) out))
+      (if (pos? bits)
+        (str out (.charAt b32-alphabet (bit-and (bit-shift-left value (- 5 bits)) 31)))
+        out))))
+
+(defn cid-raw
+  "CIDv1, raw codec (0x55), sha2-256 multihash, base32 multibase — the same
+  shape murakumo model hosting and kotobase use for content blocks."
+  [data]
+  (let [digest (sha256-bytes data)
+        prefix (js/Buffer.from #js [0x01 0x55 0x12 0x20])]
+    (str "b" (base32-lower (js/Buffer.concat #js [prefix digest])))))
+
+(defn random-hex [n] (.toString (crypto/randomBytes n) "hex"))
+
+;; ---------------------------------------------------------------- processes
+
+(defn run-process
+  "Run argv (no shell) or, with :shell, a shell command line. Returns
+  {:exit :stdout :stderr :timed-out?}. Never throws on a non-zero exit."
+  [cmd {:keys [cwd timeout-ms env shell input]}]
+  (let [opts (clj->js (cond-> {:encoding "utf8"
+                               :maxBuffer (* 64 1024 1024)
+                               :timeout (or timeout-ms 180000)
+                               :env (merge (process-env) env)}
+                        cwd (assoc :cwd cwd)
+                        input (assoc :input input)))
+        r (if shell
+            (cp/spawnSync "/bin/sh" #js ["-c" cmd] opts)
+            (cp/spawnSync (first cmd) (clj->js (rest cmd)) opts))
+        err (.-error r)]
+    {:exit (if err -1 (.-status r))
+     :stdout (or (.-stdout r) "")
+     :stderr (str (or (.-stderr r) "") (when err (str (.-message err))))
+     :timed-out? (boolean (and err (= "ETIMEDOUT" (.-code err))))}))
+
+(defn json-parse [s] (js->clj (js/JSON.parse s)))
+(defn json-str
+  ([x] (js/JSON.stringify (clj->js x)))
+  ([x indent] (js/JSON.stringify (clj->js x) nil indent)))
+
+(defn pid-alive? [pid]
+  (try (js/process.kill pid 0) true (catch :default _ false)))
+
+(defn with-lock
+  "Exclusive lock by O_EXCL lock file holding our pid. A lock whose pid is
+  gone is taken over. Returns (f) or ::busy."
+  [lock-path f]
+  (mkdirs (dirname lock-path))
+  (let [take! (fn [] (try (let [fd (fs/openSync lock-path "wx")]
+                            (fs/writeSync fd (str (.-pid js/process)))
+                            (fs/closeSync fd) true)
+                          (catch :default _ false)))
+        got? (or (take!)
+                 (let [holder (js/parseInt (try (slurp lock-path) (catch :default _ "0")) 10)]
+                   (when-not (and (pos? holder) (pid-alive? holder))
+                     (rm lock-path)
+                     (take!))))]
+    (if got?
+      (try (f) (finally (rm lock-path)))
+      ::busy)))

@@ -1,0 +1,329 @@
+(ns itonami.agent.cron
+  "Hermes-compatible cron: the same cron/jobs.json, the same prompt assembly,
+  the same cron/output/<id>/<YYYY-MM-DD_HH-MM-SS>.md documents.
+
+  What itonami-agent writes that Hermes also reads (so `hermes cron list` and
+  the fleet guards keep working on a profile itonami ticks):
+    jobs.json   next_run_at last_run_at last_status last_error failure_streak repeat.completed
+    output/     the run document, newest 50 kept
+    ticker_heartbeat / ticker_last_success (epoch float)
+    usage_audit.jsonl
+  What it does NOT write: executions.db / incidents (SQLite, Hermes-owned).
+  Its own run log is cron/itonami-runs.jsonl.
+
+  Exactly one scheduler ticks a profile: itonami.edn :runtime :scheduler
+  (:hermes | :itonami). `tick` refuses a profile whose scheduler is :hermes
+  unless forced, so the two never both fire a job."
+  (:require [clojure.string :as str]
+            [promesa.core :as p]
+            [itonami.agent.host :as h]
+            [itonami.agent.profile :as profile]
+            [itonami.agent.loop :as agent-loop]))
+
+(def cron-hint
+  (str "[IMPORTANT: You are running as a scheduled cron job. "
+       "DELIVERY: Your final response will be automatically delivered "
+       "to the user — do NOT use send_message or try to deliver "
+       "the output yourself. Just produce your report/output as your "
+       "final response and the system handles the rest. "
+       "SILENT: If there is genuinely nothing new to report, respond "
+       "with exactly \"[SILENT]\" (nothing else) to suppress delivery. "
+       "[SILENT] is a literal ASCII control token — never translate or "
+       "rephrase it, whatever language the rest of your answer uses. "
+       "Never combine [SILENT] with content — either report your "
+       "findings normally, or say [SILENT] and nothing more. "
+       "FAILURE: If a delegated child fails and this cron run must be "
+       "recorded as failed, put [CRON_FAILURE] on the first line by itself, "
+       "then explain the child failure on following lines. "
+       "RECURSION: This is a run of an EXISTING scheduled job — execute "
+       "the task now. NEVER create or update a cron job because of "
+       "recurring or future-schedule language in the task prompt below; "
+       "treat phrasing like \"each Monday\" or \"every day at 9\" as "
+       "context for this run, not as a request to schedule another job.]\n\n"))
+
+;; ---------------------------------------------------------------- 5-field cron
+
+(defn- parse-field [s lo hi]
+  (let [s (str/replace s #"(?i)^(sun|mon|tue|wed|thu|fri|sat)$"
+                       #(str ({"sun" 0 "mon" 1 "tue" 2 "wed" 3 "thu" 4 "fri" 5 "sat" 6} (str/lower-case (first %)))))]
+    (set (mapcat (fn [part]
+                   (let [[rng step] (str/split part #"/")
+                         step (if step (js/parseInt step 10) 1)
+                         [a b] (cond
+                                 (= rng "*") [lo hi]
+                                 (str/includes? rng "-") (map #(js/parseInt % 10) (str/split rng #"-"))
+                                 :else (let [v (js/parseInt rng 10)] [v (if (str/includes? part "/") hi v)]))]
+                     (range a (inc b) step)))
+                 (str/split s #",")))))
+
+(defn parse-cron [expr]
+  (let [[mi ho dm mo dw :as f] (str/split (str/trim expr) #"\s+")]
+    (when (not= 5 (count f)) (throw (ex-info (str "cron: need 5 fields: " expr) {:expr expr})))
+    {:minute (parse-field mi 0 59) :hour (parse-field ho 0 23)
+     :dom (parse-field dm 1 31) :month (parse-field mo 1 12)
+     :dow (set (map #(mod % 7) (parse-field dw 0 7)))
+     :dom* (= dm "*") :dow* (= dw "*")}))
+
+(defn- day-ok? [{:keys [dom dow dom* dow*]} d]
+  (let [a (contains? dom (.getDate d)) b (contains? dow (.getDay d))]
+    ;; Vixie cron: when both are restricted, either matches
+    (cond (and dom* dow*) true dom* b dow* a :else (or a b))))
+
+(defn next-cron
+  "First minute strictly after `after` (a Date) matching expr, in host time."
+  [expr after]
+  (let [c (parse-cron expr)
+        d (js/Date. (.getTime after))]
+    (.setSeconds d 0 0)
+    (.setMinutes d (inc (.getMinutes d)))
+    (loop [d d guard 0]
+      (cond
+        (> guard 600000) nil
+        (not (contains? (:month c) (inc (.getMonth d))))
+        (recur (js/Date. (.getFullYear d) (inc (.getMonth d)) 1 0 0) (inc guard))
+        (not (day-ok? c d))
+        (recur (js/Date. (.getFullYear d) (.getMonth d) (inc (.getDate d)) 0 0) (inc guard))
+        (not (contains? (:hour c) (.getHours d)))
+        (recur (js/Date. (.getFullYear d) (.getMonth d) (.getDate d) (inc (.getHours d)) 0) (inc guard))
+        (not (contains? (:minute c) (.getMinutes d)))
+        (recur (js/Date. (+ (.getTime d) 60000)) (inc guard))
+        :else d))))
+
+(defn next-run
+  "Next fire time of a job after `after`, or nil for a spent one-shot."
+  [job after]
+  (let [{:strs [kind expr minutes run_at]} (get job "schedule")]
+    (case kind
+      "cron" (next-cron expr after)
+      "interval" (js/Date. (+ (.getTime after) (* 60000 minutes)))
+      "once" (let [t (h/parse-time run_at)] (when (and t (> (.getTime t) (.getTime after))) t))
+      nil)))
+
+(defn parse-schedule
+  "CLI schedule string -> Hermes schedule map. Supports '30m', 'every 2h',
+  a 5-field cron expression and an ISO timestamp."
+  [s]
+  (let [s (str/trim s)]
+    (if-let [[_ n u] (or (re-matches #"^(\d+)\s*([mhd])$" s) (re-matches #"^every\s+(\d+)\s*([mhd])$" s))]
+      (let [mins (* (js/parseInt n 10) ({"m" 1 "h" 60 "d" 1440} u))]
+        {"kind" "interval" "minutes" mins "display" (str "every " mins "m")})
+      (if (= 5 (count (str/split s #"\s+")))
+        (do (parse-cron s) {"kind" "cron" "expr" s "display" s})
+        (if-let [t (h/parse-time s)]
+          {"kind" "once" "run_at" (h/iso-local t) "display" (str "once at " (h/human-time t))}
+          (throw (ex-info (str "unrecognised schedule: " s) {:schedule s})))))))
+
+;; ---------------------------------------------------------------- jobs.json
+
+(defn jobs-path [home] (h/join home "cron" "jobs.json"))
+
+(defn read-jobs [home] (get (profile/read-jobs home) "jobs" []))
+
+(defn write-jobs! [home jobs]
+  (h/spit-atomic (jobs-path home) (h/json-str {"jobs" jobs "updated_at" (h/iso-local (js/Date.) true)} 2)))
+
+(defn update-job! [home id f]
+  (let [jobs (read-jobs home)]
+    (write-jobs! home (mapv #(if (= id (get % "id")) (f %) %) jobs))))
+
+(defn find-job [home id-or-name]
+  (first (filter #(or (= id-or-name (get % "id")) (= id-or-name (get % "name"))) (read-jobs home))))
+
+(defn active? [job]
+  (and (not (false? (get job "enabled")))
+       (not (#{"paused" "completed" "removed"} (get job "state")))))
+
+(defn due? [job now]
+  (and (active? job)
+       (when-let [t (h/parse-time (get job "next_run_at"))] (<= (.getTime t) (.getTime now)))))
+
+(defn new-job [{:keys [schedule prompt name script deliver model provider toolsets workdir]}]
+  (let [sched (parse-schedule schedule)
+        now (js/Date.)]
+    (cond-> {"id" (h/random-hex 6) "name" (or name (subs (str prompt) 0 (min 40 (count (str prompt)))))
+             "prompt" (or prompt "") "skills" [] "skill" nil
+             "model" model "provider" provider "base_url" nil
+             "script" script "no_agent" false "context_from" nil
+             "schedule" sched "schedule_display" (get sched "display")
+             "repeat" {"times" (when (= "once" (get sched "kind")) 1) "completed" 0}
+             "enabled" true "state" "scheduled" "paused_at" nil "paused_reason" nil
+             "created_at" (h/iso-local now true)
+             "next_run_at" (some-> (next-run {"schedule" sched} now) h/iso-local)
+             "last_run_at" nil "last_status" nil "last_error" nil "last_delivery_error" nil
+             "failure_streak" 0 "deliver" (or deliver "local") "origin" nil
+             "enabled_toolsets" toolsets "workdir" workdir}
+      true identity)))
+
+;; ---------------------------------------------------------------- one run
+
+(defn- script-command [path]
+  (cond
+    (re-find #"\.(sh|bash)$" path) ["bash" path]
+    (re-find #"\.cljk$" path) ["kbb" "--backend" "sci" path]
+    (re-find #"\.(m?js)$" path) ["node" path]
+    :else ["python3" path]))
+
+(defn run-script
+  "[ok? output] like Hermes _run_job_script. Paths must resolve inside scripts/."
+  [{:keys [home config env]} job]
+  (let [scripts (h/join home "scripts")
+        abs (h/join scripts (get job "script"))]
+    (cond
+      (not (str/starts-with? abs (str scripts "/"))) [false (str "script path escapes scripts/: " (get job "script"))]
+      (not (h/file? abs)) [false (str "script not found: " abs)]
+      :else
+      (let [r (h/run-process (script-command abs)
+                             {:cwd (or (some-> (get job "workdir") h/expand) scripts)
+                              :env (assoc env "HERMES_HOME" home "ITONAMI_PROFILE_HOME" home)
+                              :timeout-ms (* 1000 (or (get-in config ["cron" "script_timeout_seconds"])
+                                                      (some-> (h/env "HERMES_CRON_SCRIPT_TIMEOUT") js/parseInt)
+                                                      3600))})]
+        (if (zero? (:exit r))
+          [true (str/trim (:stdout r))]
+          [false (str "Script exited with code " (:exit r)
+                      (when-not (str/blank? (:stderr r)) (str "\nstderr:\n" (str/trim (:stderr r))))
+                      (when-not (str/blank? (:stdout r)) (str "\nstdout:\n" (str/trim (:stdout r)))))])))))
+
+(defn- wake-false? [out]
+  (let [last-line (last (str/split-lines out))]
+    (boolean (try (false? (get (h/json-parse last-line) "wakeAgent")) (catch :default _ false)))))
+
+(defn build-prompt
+  "[prompt nil] or [nil reason] when the agent must be skipped."
+  [prof job]
+  (let [base (str (get job "prompt"))]
+    (if-let [_ (get job "script")]
+      (let [[ok? out] (run-script prof job)]
+        (cond
+          (and ok? (str/blank? out)) [nil "script produced no output"]
+          (and ok? (wake-false? out)) [nil "Script gate returned `wakeAgent=false`"]
+          :else
+          [(str cron-hint
+                "## " (if ok? "Script Output" "Script Error") "\n"
+                (if ok? "The following data was collected by a pre-run script. Use it as context for your analysis."
+                    "The data-collection script failed. Report this to the user.")
+                "\n\n```\n" out "\n```\n\n" base)
+           nil]))
+      [(str cron-hint base) nil])))
+
+(defn- output-doc [job {:keys [prompt response failed? status-line]} at]
+  (str "# Cron Job: " (get job "name") (when failed? " (FAILED)") "\n\n"
+       "**Job ID:** " (get job "id") "\n"
+       "**Run Time:** " (h/human-time at) "\n"
+       "**Schedule:** " (or (get job "schedule_display") (get-in job ["schedule" "display"])) "\n"
+       (when status-line (str status-line "\n"))
+       "**Engine:** itonami-agent\n"
+       "\n## Prompt\n\n" (or prompt "") "\n\n## Response\n\n"
+       (if (str/blank? response) "(No response generated)" response) "\n"))
+
+(defn save-output! [home job doc at]
+  (let [dir (h/join home "cron" "output" (get job "id"))
+        f (h/join dir (str (h/stamp at) ".md"))]
+    (h/spit f doc {:mode 0600})
+    (doseq [old (drop 50 (reverse (filter #(str/ends-with? % ".md") (h/ls dir))))]
+      (h/rm (h/join dir old)))
+    f))
+
+(defn- tool-sets-for [config job]
+  (or (seq (get job "enabled_toolsets"))
+      (seq (get-in config ["platform_toolsets" "cron"]))
+      ["hermes-cron"]))
+
+(defn run-job
+  "Run one job now (the agent may run locally or, via `executor`, on a peer).
+  executor: (fn [prof prompt opts]) -> promise of a loop result.
+  Resolves to {:status ok|error|silent :output-file f :result r}."
+  [prof job {:keys [executor manual?]}]
+  (let [home (:home prof)
+        started (js/Date.)
+        executor (or executor (fn [prof prompt opts] (agent-loop/run prof prompt opts)))
+        [prompt skip] (build-prompt prof job)]
+    (if skip
+      (let [f (save-output! home job (output-doc job {:prompt "" :response "[SILENT]" :status-line (str "**Status:** " skip)}) started)]
+        (update-job! home (get job "id") #(assoc % "last_run_at" (h/iso-local started true) "last_status" "ok" "last_error" nil))
+        (p/resolved {:status "silent" :output-file f}))
+      (p/let [r (executor prof prompt {:platform "cron"
+                                       :toolsets (tool-sets-for (:config prof) job)
+                                       :model (get job "model") :provider (get job "provider")
+                                       :pinned? (boolean (get job "model"))
+                                       :cwd (some-> (get job "workdir") h/expand)
+                                       :load-context? (boolean (get job "workdir"))})]
+        (let [final (:final r)
+              failed? (or (not= "completed" (:exit-reason r))
+                          (some-> final str/trim (str/starts-with? "[CRON_FAILURE]")))
+              silent? (= "[SILENT]" (some-> final str/trim))
+              err (when failed? (or (get-in r [:error :error]) (:exit-reason r)))
+              doc (output-doc job {:prompt prompt
+                                   :response (if failed? (str (or final "") (when err (str "\n\n## Error\n\n```\n" err "\n```"))) final)
+                                   :failed? failed?
+                                   :status-line (when (:peer r) (str "**Peer:** " (:peer r)))}
+                              started)
+              f (save-output! home job doc started)
+              finished (js/Date.)]
+          (update-job! home (get job "id")
+                       (fn [j] (-> j
+                                   (assoc "last_run_at" (h/iso-local started true)
+                                          "last_status" (if failed? "error" "ok")
+                                          "last_error" err
+                                          "failure_streak" (if failed? (inc (or (get j "failure_streak") 0)) 0))
+                                   (update-in ["repeat" "completed"] (fnil inc 0))
+                                   (cond-> (and (get-in j ["repeat" "times"])
+                                                (>= (inc (or (get-in j ["repeat" "completed"]) 0)) (get-in j ["repeat" "times"])))
+                                     (assoc "state" "completed" "enabled" false "next_run_at" nil)))))
+          (h/spit (h/join home "cron" "usage_audit.jsonl")
+                  (str (h/json-str {"ts" (h/iso-local finished true) "job_id" (get job "id") "fire_id" (h/random-hex 8)
+                                    "prompt_tokens" (get-in r [:usage "prompt_tokens"]) "completion_tokens" (get-in r [:usage "completion_tokens"])
+                                    "total_tokens" (get-in r [:usage "total_tokens"]) "response_silent" silent?
+                                    "deliver_target" (get job "deliver") "model" (:model r)
+                                    "duration_ms" (- (.getTime finished) (.getTime started)) "error" err
+                                    "engine" "itonami-agent"}) "\n")
+                  {:append? true})
+          (h/spit (h/join home "cron" "itonami-runs.jsonl")
+                  (str (h/json-str {"ts" (h/iso-local finished true) "job_id" (get job "id") "manual" (boolean manual?)
+                                    "status" (cond failed? "error" silent? "silent" :else "ok")
+                                    "exit_reason" (:exit-reason r) "turns" (:turns r) "provider" (:provider r) "model" (:model r)
+                                    "peer" (:peer r) "receipt" (:receipt r)
+                                    "attempts" (mapv #(select-keys % [:provider :model :status :error]) (:attempts r))
+                                    "output" f}) "\n")
+                  {:append? true})
+          {:status (cond failed? "error" silent? "silent" :else "ok") :output-file f :result r})))))
+
+;; ---------------------------------------------------------------- tick
+
+(defn scheduler-of [prof] (get-in prof [:itonami :runtime :scheduler] :hermes))
+
+(defn tick
+  "Run every due job of one profile once. Advances next_run_at before running
+  (at-most-once, like Hermes). Resolves to a vector of run results, or
+  {:skipped reason}."
+  [prof {:keys [force? executor]}]
+  (let [home (:home prof)
+        lock (h/join home "cron" ".itonami-tick.lock")]
+    (cond
+      (and (not force?) (not= :itonami (scheduler-of prof)))
+      (p/resolved {:skipped (str "scheduler is " (name (scheduler-of prof)) " (itonami.edn :runtime :scheduler)")})
+
+      (h/exists? lock)
+      (let [holder (js/parseInt (try (h/slurp lock) (catch :default _ "0")) 10)]
+        (if (and (pos? holder) (h/pid-alive? holder))
+          (p/resolved {:skipped "another itonami tick holds the lock"})
+          (do (h/rm lock) (tick prof {:force? force? :executor executor}))))
+
+      :else
+      (let [_ (h/spit lock (str (.-pid js/process)))
+            now (js/Date.)
+            due (filter #(due? % now) (read-jobs home))]
+        ;; advance first: a crash mid-run must not re-fire the same slot
+        (doseq [j due]
+          (update-job! home (get j "id") #(assoc % "next_run_at" (some-> (next-run % now) h/iso-local))))
+        (-> (p/loop [[j & more] due acc []]
+              (if (nil? j)
+                acc
+                (p/let [r (run-job prof j {:executor executor})]
+                  (p/recur more (conj acc (assoc r :job (get j "id")))))))
+            (p/then (fn [rs]
+                      (let [t (str (/ (h/now-ms) 1000))]
+                        (h/spit (h/join home "cron" "ticker_heartbeat") t)
+                        (h/spit (h/join home "cron" "ticker_last_success") t))
+                      rs))
+            (p/finally (fn [] (h/rm lock))))))))

@@ -1,0 +1,237 @@
+(ns itonami.agent.tools
+  "The Hermes core tools, same names and argument shapes (tools/*.py), so a
+  SOUL or skill written for Hermes calls them unchanged.
+
+  Toolsets mirror toolsets.py: terminal / file / web / skills / memory.
+  Results are JSON strings, as Hermes returns them.
+
+  `ctx` carries where a tool may act:
+    {:cwd dir  :home profile-home  :roots [dirs writes may touch] | nil
+     :writes (atom [])  :timeout-ms n}
+  :roots nil means unrestricted (local runs, like Hermes' local backend).
+  A peer run always sets :roots to the bundle's materialized home, so a turn
+  run on someone else's machine cannot write outside the copy it was given."
+  (:require [clojure.string :as str]
+            [promesa.core :as p]
+            [itonami.agent.host :as h]))
+
+(defn- fn-schema [name desc props required]
+  {"type" "function"
+   "function" {"name" name "description" desc
+               "parameters" {"type" "object" "properties" props "required" required}}})
+
+(def schemas
+  {"terminal"
+   (fn-schema "terminal" "Execute a shell command on the host and return its output. Use for running scripts, git, builds and inspecting the system."
+              {"command" {"type" "string" "description" "The command to execute"}
+               "timeout" {"type" "integer" "description" "Seconds before the command is killed (default 180)"}
+               "workdir" {"type" "string" "description" "Working directory (default: the profile's terminal cwd)"}
+               "background" {"type" "boolean" "description" "Not supported by itonami-agent; ignored"}}
+              ["command"])
+   "read_file"
+   (fn-schema "read_file" "Read a text file with line numbers (LINE_NUM|CONTENT)."
+              {"path" {"type" "string"} "offset" {"type" "integer" "description" "1-based first line"}
+               "limit" {"type" "integer" "description" "max lines (<= 2000)"}}
+              ["path"])
+   "write_file"
+   (fn-schema "write_file" "Write content to a file, creating parent directories. Overwrites."
+              {"path" {"type" "string"} "content" {"type" "string"}}
+              ["path" "content"])
+   "patch"
+   (fn-schema "patch" "Replace old_string with new_string in a file. old_string must be unique unless replace_all."
+              {"path" {"type" "string"} "old_string" {"type" "string"} "new_string" {"type" "string"}
+               "replace_all" {"type" "boolean"}}
+              ["path" "old_string" "new_string"])
+   "search_files"
+   (fn-schema "search_files" "Search file contents (regex) or file names (glob) under a path."
+              {"pattern" {"type" "string"} "target" {"type" "string" "enum" ["content" "files"]}
+               "path" {"type" "string"} "file_glob" {"type" "string"} "limit" {"type" "integer"}}
+              ["pattern"])
+   "web_search"
+   (fn-schema "web_search" "Search the web. Returns titles, urls and snippets."
+              {"query" {"type" "string"} "limit" {"type" "integer"}}
+              ["query"])
+   "web_extract"
+   (fn-schema "web_extract" "Fetch up to 5 URLs and return their readable text."
+              {"urls" {"type" "array" "items" {"type" "string"}} "char_limit" {"type" "integer"}}
+              ["urls"])
+   "skill_view"
+   (fn-schema "skill_view" "Read a skill's SKILL.md (or a file inside the skill)."
+              {"name" {"type" "string"} "file_path" {"type" "string"}}
+              ["name"])
+   "memory"
+   (fn-schema "memory" "Add, replace or remove an entry in persistent memory (MEMORY.md / USER.md)."
+              {"action" {"type" "string" "enum" ["add" "replace" "remove"]}
+               "target" {"type" "string" "enum" ["memory" "user"]}
+               "content" {"type" "string"} "old_text" {"type" "string"} "new_text" {"type" "string"}}
+              ["action"])})
+
+(def toolsets
+  {"terminal" ["terminal"]
+   "file" ["read_file" "write_file" "patch" "search_files"]
+   "web" ["web_search" "web_extract"]
+   "search" ["web_search"]
+   "skills" ["skill_view"]
+   "memory" ["memory"]
+   ;; the bundles Hermes names
+   "hermes-cli" ["terminal" "read_file" "write_file" "patch" "search_files" "web_search" "web_extract" "skill_view" "memory"]
+   "hermes-cron" ["terminal" "read_file" "write_file" "patch" "search_files" "skill_view"]})
+
+(defn tool-names
+  "Toolset names -> distinct tool names, unknown toolsets ignored."
+  [sets]
+  (vec (distinct (mapcat #(get toolsets % []) sets))))
+
+(defn tool-schemas [names] (vec (keep schemas names)))
+
+;; ---------------------------------------------------------------- helpers
+
+(defn- ok [m] (h/json-str m))
+(defn- err [msg] (h/json-str {"error" msg}))
+
+(defn- resolve-path [ctx p]
+  (let [p (h/expand (str p))]
+    (if (str/starts-with? p "/") p (h/join (:cwd ctx) p))))
+
+(defn- writable? [ctx abs]
+  (or (nil? (:roots ctx))
+      (some #(or (= abs %) (str/starts-with? abs (str % "/"))) (:roots ctx))))
+
+(defn- record-write! [ctx abs]
+  (when-let [w (:writes ctx)] (swap! w conj abs)))
+
+(defn- clip [s n] (if (> (count s) n) (str (subs s 0 n) "\n…[truncated " (- (count s) n) " chars]") s))
+
+;; ---------------------------------------------------------------- tools
+
+(defn terminal [ctx {:strs [command timeout workdir]}]
+  (let [cwd (if workdir (resolve-path ctx workdir) (:cwd ctx))]
+    (if (and (:roots ctx) (not (writable? ctx cwd)))
+      (err (str "workdir outside this run's roots: " cwd))
+      (let [r (h/run-process command {:shell true :cwd cwd
+                                      :timeout-ms (* 1000 (or timeout (:terminal-timeout-s ctx) 180))
+                                      :env (:tool-env ctx)})]
+        (ok {"output" (clip (str (:stdout r) (when-not (str/blank? (:stderr r)) (str "\n[stderr]\n" (:stderr r)))) 50000)
+             "exit_code" (:exit r)
+             "error" (when (:timed-out? r) "timeout")})))))
+
+(defn read-file [ctx {:strs [path offset limit]}]
+  (let [abs (resolve-path ctx path)]
+    (if-not (h/file? abs)
+      (err (str "file not found: " abs))
+      (let [ls (str/split-lines (h/slurp abs))
+            off (max 1 (or offset 1))
+            lim (min 2000 (or limit 2000))
+            sel (take lim (drop (dec off) ls))]
+        (ok {"content" (str/join "\n" (map-indexed (fn [i l] (str (.padStart (str (+ off i)) 6 " ") "|" l)) sel))
+             "total_lines" (count ls)
+             "truncated" (> (count ls) (+ (dec off) lim))})))))
+
+(defn write-file [ctx {:strs [path content]}]
+  (let [abs (resolve-path ctx path)]
+    (if-not (writable? ctx abs)
+      (err (str "path outside this run's roots: " abs))
+      (do (h/spit abs (str content))
+          (record-write! ctx abs)
+          (ok {"bytes_written" (count (str content)) "path" abs})))))
+
+(defn patch [ctx {:strs [path old_string new_string replace_all]}]
+  (let [abs (resolve-path ctx path)]
+    (cond
+      (not (writable? ctx abs)) (err (str "path outside this run's roots: " abs))
+      (not (h/file? abs)) (err (str "file not found: " abs))
+      :else
+      (let [s (h/slurp abs)
+            n (count (re-seq (re-pattern (str/replace old_string #"[.*+?^${}()|\[\]\\]" "\\$&")) s))]
+        (cond
+          (zero? n) (err "old_string not found")
+          (and (> n 1) (not replace_all)) (err (str "old_string found " n " times; pass replace_all or add context"))
+          :else (do (h/spit abs (if replace_all (str/replace s old_string new_string) (str/replace-first s old_string new_string)))
+                    (record-write! ctx abs)
+                    (ok {"replacements" (if replace_all n 1) "path" abs})))))))
+
+(defn search-files [ctx {:strs [pattern target path file_glob limit]}]
+  (let [dir (resolve-path ctx (or path "."))
+        lim (or limit 50)
+        rg? (zero? (:exit (h/run-process ["which" "rg"] {})))
+        r (if (= target "files")
+            (if rg?
+              (h/run-process ["rg" "--files" "-g" pattern dir] {:timeout-ms 30000})
+              (h/run-process ["find" dir "-name" pattern] {:timeout-ms 30000}))
+            (if rg?
+              (h/run-process (cond-> ["rg" "-n" "--no-heading" "-m" "20"] file_glob (into ["-g" file_glob]) true (into ["-e" pattern dir])) {:timeout-ms 30000})
+              (h/run-process ["grep" "-rnE" pattern dir] {:timeout-ms 30000})))
+        hits (take lim (remove str/blank? (str/split-lines (:stdout r))))]
+    (ok {"matches" (vec hits) "count" (count hits)})))
+
+(defn- strip-html [html]
+  (-> html
+      (str/replace #"(?is)<(script|style|noscript)[^>]*>.*?</\1>" " ")
+      (str/replace #"(?i)<br\s*/?>|</p>|</div>|</li>|</h[1-6]>" "\n")
+      (str/replace #"<[^>]+>" " ")
+      (str/replace #"&nbsp;" " ") (str/replace #"&amp;" "&") (str/replace #"&lt;" "<")
+      (str/replace #"&gt;" ">") (str/replace #"&quot;" "\"") (str/replace #"&#39;" "'")
+      (str/replace #"[ \t]+" " ") (str/replace #"\n\s*\n+" "\n\n") str/trim))
+
+(defn- fetch-text [url]
+  (-> (js/fetch url #js {:headers #js {"User-Agent" "Mozilla/5.0 (compatible; itonami-agent/0.1; +https://itonami.cloud)"}
+                         :redirect "follow"})
+      (p/then (fn [^js r] (p/let [t (.text r)] {:status (.-status r) :text t})))))
+
+(defn web-extract [_ctx {:strs [urls char_limit]}]
+  (p/let [res (p/all (for [u (take 5 urls)]
+                       (-> (fetch-text u)
+                           (p/then (fn [{:keys [status text]}]
+                                     {"url" u "status" status "content" (clip (strip-html text) (or char_limit 15000))}))
+                           (p/catch (fn [e] {"url" u "error" (.-message e)})))))]
+    (ok {"results" (vec res)})))
+
+(defn web-search [_ctx {:strs [query limit]}]
+  ;; keyless HTML endpoint; Hermes' paid search backends are not assumed
+  (-> (fetch-text (str "https://html.duckduckgo.com/html/?q=" (js/encodeURIComponent query)))
+      (p/then (fn [{:keys [text]}]
+                (let [hits (->> (re-seq #"(?s)class=\"result__a\" href=\"([^\"]+)\"[^>]*>(.*?)</a>.*?class=\"result__snippet\"[^>]*>(.*?)</a>" text)
+                                (map (fn [[_ href title snip]]
+                                       (let [u (or (some-> (re-find #"uddg=([^&]+)" href) second js/decodeURIComponent) href)]
+                                         {"url" u "title" (strip-html title) "description" (strip-html snip)})))
+                                (take (or limit 8)))]
+                  (ok {"results" (vec hits)}))))
+      (p/catch (fn [e] (err (str "web_search: " (.-message e)))))))
+
+(defn skill-view [ctx {:strs [name file_path]}]
+  (let [skills (h/join (:home ctx) "skills")
+        dir (or (first (filter #(h/dir? %) [(h/join skills name)]))
+                (first (for [cat (h/ls skills) :let [d (h/join skills cat name)] :when (h/dir? d)] d)))]
+    (if-not dir
+      (err (str "skill not found: " name))
+      (let [f (h/join dir (or file_path "SKILL.md"))]
+        (if (h/file? f) (ok {"name" name "content" (h/slurp f)}) (err (str "no such file in skill: " file_path)))))))
+
+(defn memory [ctx {:strs [action target content old_text new_text]}]
+  (let [f (h/join (:home ctx) "memories" (if (= target "user") "USER.md" "MEMORY.md"))
+        entries (if (h/file? f) (vec (remove str/blank? (str/split (h/slurp f) #"\n§\n"))) [])
+        entries' (case action
+                   "add" (conj entries (str content))
+                   "replace" (mapv #(if (str/includes? % (str old_text)) (str/replace % old_text (or new_text content "")) %) entries)
+                   "remove" (vec (remove #(str/includes? % (str (or old_text content))) entries))
+                   entries)]
+    (if (and (:roots ctx) (not (writable? ctx f)))
+      (err "memory is not writable in this run")
+      (do (h/spit f (str/join "\n§\n" entries'))
+          (ok {"entries" (count entries')})))))
+
+(def impls
+  {"terminal" terminal "read_file" read-file "write_file" write-file "patch" patch
+   "search_files" search-files "web_extract" web-extract "web_search" web-search
+   "skill_view" skill-view "memory" memory})
+
+(defn call
+  "Run one tool call. Always resolves to a result string."
+  [ctx allowed name args-json]
+  (let [args (try (if (string? args-json) (h/json-parse (if (str/blank? args-json) "{}" args-json)) args-json)
+                  (catch :default _ ::bad))]
+    (cond
+      (= args ::bad) (p/resolved (err (str "invalid JSON arguments for " name)))
+      (not (some #{name} allowed)) (p/resolved (err (str "tool not available in this run: " name)))
+      :else (-> (p/do ((get impls name) ctx args))
+                (p/catch (fn [e] (err (str name ": " (.-message e)))))))))

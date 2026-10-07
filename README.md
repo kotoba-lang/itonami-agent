@@ -1,0 +1,101 @@
+# itonami-agent
+
+A Hermes-compatible agent written in kotoba (`.cljk` on kbb), with peer-to-peer
+execution of agent turns. No dependencies beyond the kbb engine; no JVM, no
+Python, no npm packages.
+
+```
+bin/itonami-agent -p hiraku-soudan -z "質問"            # one turn, like `hermes -p … -z`
+bin/itonami-agent -p hiraku-kyozai cron run <job-id>    # a Hermes cron job, same files
+bin/itonami-agent peer serve --port 7420                # run turns for trusted peers
+bin/itonami-agent peer run -p hiraku-soudan -z "質問"   # run this turn on a peer
+```
+
+## Compatibility with Hermes Agent
+
+itonami-agent reads and writes the Hermes profile layout in place
+(`~/.hermes/profiles/<name>/`). Hermes keeps working on every profile, and
+the two can be swapped per profile.
+
+| Hermes surface | itonami-agent |
+|---|---|
+| `SOUL.md`, `profile.yaml`, `config.yaml`, `.env`, `secrets.command` | read the same way. YAML reader is checked against PyYAML on all 1,954 host files: 0 differences |
+| `model` / `providers` / `fallback_providers`, job pin disables fallback | same resolution order (`cron/scheduler.py`, `runtime_provider_custom.py`) |
+| `agent.max_turns`, `agent.run_budget_seconds` (80 % wrap-up notice, hop timeout ≤ ½ remaining budget) | same |
+| tools `terminal read_file write_file patch search_files web_search web_extract skill_view memory`; toolsets `hermes-cli`, `hermes-cron`, `terminal`, `file`, `web`, `skills`, `memory` | same names and argument shapes; results are JSON strings |
+| `cron/jobs.json` (all fields), 5-field cron / interval / once schedules | read and written in Hermes' format; Hermes' own `cron.jobs.load_jobs()` / `get_due_jobs()` read what itonami writes |
+| cron prompt: `_CRON_HINT`, `## Script Output` / `## Script Error` block, empty stdout and `{"wakeAgent": false}` skip, `[SILENT]`, `[CRON_FAILURE]` | identical text and semantics |
+| `cron/output/<id>/<YYYY-MM-DD_HH-MM-SS>.md`, newest 50, mode 0600 | identical layout (adds `**Engine:**` / `**Peer:**` lines) |
+| `usage_audit.jsonl`, `ticker_heartbeat`, `ticker_last_success` | written |
+| `-p`, `-z` (stdout = final text, exit 1 + `… -z: reason` on stderr), `-m`, `--provider`, `-t`, `cron list/create/run/tick/runs/status`, `profile list/show`, `chat` | same flags |
+| `executions.db`, incidents, notepad, messaging gateway adapters, `delegate_task`, browser tools, MCP | **not implemented**; itonami logs runs to `cron/itonami-runs.jsonl` |
+
+## itonami profile
+
+`profile itonamify <p>|--all` adds `itonami.edn` (schema
+`cloud.itonami.profile.v1`) next to the Hermes files. Hermes ignores it;
+deleting it returns the profile to plain Hermes.
+
+```clojure
+{:itonami/schema "cloud.itonami.profile.v1"
+ :profile/id "hiraku-soudan"
+ :runtime   {:engine :itonami-agent :scheduler :hermes}   ; who ticks cron
+ :placement {:mode :p2p :order [:peer :local] :peers :trusted :inference-rail :murakumo}
+ :state     {:workspace :host-local :results :cid-receipts :secrets :never-leave-host}
+ :bundle    {:cid "bafkrei…" :files 5 :skills []}          ; content address of the definition
+ :capabilities [...]}                                       ; copied from yakuwari.edn, grants nothing
+```
+
+Exactly one scheduler ticks a profile:
+
+- `profile adopt <p>` sets `:scheduler :itonami` and writes Hermes'
+  `gateway.parked` marker, so the Hermes gateway stops ticking it;
+  `gateway run` then ticks it.
+- `profile release <p>` reverses both.
+
+## Peer-to-peer execution
+
+Every node runs the same program. There is no coordinator.
+
+```
+requester (node A)                               peer (node B)
+  itonami.edn :placement [:peer :local]
+  discover: peers.edn + one gossip hop  ── GET /itonami/v1/peer ──▶  signed {did load rails profiles peers}
+  pick: trusted, not full, holds CID first
+  bundle = SOUL + config − host-local + jobs + scripts  (CIDv1 raw sha2-256)
+  POST /itonami/v1/run  (signed envelope: profile cid prompt opts [files])  ──▶ verify sig, trust, ts, nonce
+                                                    ◀── 202 {run_id} (signed)
+                                                    `peer exec` child process:
+                                                      verify bundle CID, materialize ~/.itonami/peer-runs/<cid>/
+                                                      rebase A's home paths onto the copy
+                                                      run the turn with B's own inference rail
+                                                      (profile chain + murakumo), writes confined to the copy
+  GET /itonami/v1/run/<id> every 3 s (signed)  ◀── 200 signed {final usage attempts writes result_sha256}
+  verify B's signature and CID, apply workspace/ writes, record receipt in cron/itonami-runs.jsonl
+```
+
+- **Identity**: ed25519 per node (`~/.itonami/node/key.json`, 0600), named by
+  `did:key:z6Mk…`. A murakumo fleet node advertises `MURAKUMO_NODE_DID`
+  beside it.
+- **Trust**: `~/.itonami/peers.edn`. Gossip learns URLs but never trust.
+- **Secrets never cross**. The executing peer pays inference with its own
+  rail (`~/.itonami/peer.env` or its environment); `murakumo` is put on the
+  chain when the profile's `:inference-rail` is `:murakumo`.
+- **Not a sandbox.** `terminal` on a peer is a real shell on that peer. Trust
+  is the boundary. The four conditions of ADR-2609242300 (gVisor/rootless
+  isolation, tunnel, cross-node resume, secret isolation) are still open.
+
+### murakumo
+
+murakumo today is hub-and-spoke: nodes poll `api.murakumo.cloud` for
+inference jobs, and it has no generic agent-step job kind. itonami-agent
+uses murakumo as the shared inference rail (`murakumo/free`, `mishima`) and
+keeps agent execution on its own peer protocol. Making agent turns a
+murakumo job kind is a change on the murakumo side (`poll_worker.cljk`) and
+not done here.
+
+## Tests
+
+```
+kbb --backend sci --classpath src:test run-tests.cljk
+```

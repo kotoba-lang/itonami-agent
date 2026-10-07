@@ -1,0 +1,217 @@
+(ns itonami.agent.profile
+  "A profile, read the way Hermes reads it, plus the itonami layer.
+
+  Hermes layout (unchanged, still authoritative for Hermes):
+    <home>/SOUL.md profile.yaml config.yaml .env cron/jobs.json scripts/ skills/ workspace/
+
+  itonami layer (additive; Hermes never reads it):
+    <home>/itonami.edn          what the profile is on the itonami plane:
+                                identity, placement (local | p2p), inference
+                                rail, state policy, bundle CID
+    <home>/.itonami/            host-local itonami state (run receipts, peer
+                                bundle cache). Never exported, never sent.
+
+  A profile with an itonami.edn is an *itonami profile*. It stays a valid
+  Hermes profile: deleting itonami.edn returns it to plain Hermes."
+  (:require [clojure.string :as str]
+            [cljs.reader :as reader]
+            [itonami.agent.host :as h]
+            [itonami.agent.yaml :as yaml]))
+
+(def manifest-schema "cloud.itonami.profile.v1")
+
+(defn hermes-root []
+  (h/expand (or (h/env "ITONAMI_HERMES_ROOT") "~/.hermes")))
+
+(defn valid-name? [n] (boolean (re-matches #"^[a-z0-9][a-z0-9_-]{0,63}$" (str n))))
+
+(defn home
+  "Profile name -> its home directory. `default` is the root itself."
+  [name]
+  (if (or (nil? name) (= name "default"))
+    (hermes-root)
+    (h/join (hermes-root) "profiles" name)))
+
+(defn names []
+  (let [d (h/join (hermes-root) "profiles")]
+    (vec (filter #(and (valid-name? %) (h/dir? (h/join d %))) (h/ls d)))))
+
+;; ---------------------------------------------------------------- env
+
+(defn parse-dotenv [text]
+  (into {}
+        (keep (fn [line]
+                (let [l (str/trim line)]
+                  (when-not (or (str/blank? l) (str/starts-with? l "#"))
+                    (when-let [[_ k v] (re-matches #"^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$" l)]
+                      (let [v (str/trim v)
+                            v (cond
+                                (and (str/starts-with? v "\"") (str/ends-with? v "\"") (> (count v) 1)) (subs v 1 (dec (count v)))
+                                (and (str/starts-with? v "'") (str/ends-with? v "'") (> (count v) 1)) (subs v 1 (dec (count v)))
+                                :else (str/trim (str/replace v #"\s+#.*$" "")))]
+                        [k v])))))
+        (str/split-lines (or text "")))))
+
+(defn- secrets-command-env
+  "Hermes `secrets.command`: a helper that prints KEY=VAL lines (e.g. from the
+  macOS keychain). Run only when enabled; a failing helper yields {}."
+  [config]
+  (let [c (get-in config ["secrets" "command"])
+        {:strs [enabled command helper_timeout_seconds]} (if (map? c) c {})]
+    (if (and enabled (string? command) (not (str/blank? command)))
+      (let [r (h/run-process command {:shell true :timeout-ms (* 1000 (or helper_timeout_seconds 10))})]
+        (if (zero? (:exit r)) (parse-dotenv (:stdout r)) {}))
+      {})))
+
+;; ---------------------------------------------------------------- load
+
+(defn read-edn-file [p] (when (h/file? p) (reader/read-string (h/slurp p))))
+
+(defn read-yaml-file [p] (if (h/file? p) (yaml/parse (h/slurp p)) {}))
+
+(defn read-jobs [home]
+  (let [p (h/join home "cron" "jobs.json")]
+    (if (h/file? p) (h/json-parse (h/slurp p)) {"jobs" []})))
+
+(declare load-profile*)
+
+(defn load-profile
+  "Everything a run needs, as data. Secrets are resolved into :env and never
+  leave this map except into the provider call that names them."
+  ([name] (load-profile name {}))
+  ([name opts] (load-profile* (home name) name opts)))
+
+(defn load-profile*
+  "load-profile for an explicit home directory (a peer's materialized bundle).
+  opts {:secrets? false} skips .env / secrets.command (for commands that only
+  read the definition: list, show, itonamify, bundle)."
+  ([home name] (load-profile* home name {}))
+  ([home name {:keys [secrets?] :or {secrets? true}}]
+  (do
+    (when-not (h/dir? home)
+      (throw (ex-info (str "profile not found: " name) {:itonami/error :profile-not-found :profile name})))
+    (let [config (read-yaml-file (h/join home "config.yaml"))
+          root-env (when (= home (hermes-root)) (parse-dotenv (when (h/file? (h/join home ".env")) (h/slurp (h/join home ".env")))))
+          prof-env (parse-dotenv (when (h/file? (h/join home ".env")) (h/slurp (h/join home ".env"))))
+          env (if secrets? (merge (h/process-env) root-env (secrets-command-env config) prof-env) {})]
+      {:name (or name "default")
+       :home home
+       :soul (when (h/file? (h/join home "SOUL.md")) (h/slurp (h/join home "SOUL.md")))
+       :profile-yaml (read-yaml-file (h/join home "profile.yaml"))
+       :config config
+       :env env
+       :jobs (read-jobs home)
+       :itonami (read-edn-file (h/join home "itonami.edn"))}))))
+
+(defn description [p] (get-in p [:profile-yaml "description"]))
+
+;; ---------------------------------------------------------------- bundle (content-addressed profile)
+
+(def host-local-config-keys
+  "Same set scripts/hermes-profile-repo.cljk keeps on the host."
+  #{"secrets" "command_allowlist" "onboarding" "terminal" "skills"})
+
+(def job-definition-keys
+  #{"id" "name" "prompt" "skills" "skill" "script" "no_agent" "schedule" "deliver" "enabled"
+    "enabled_toolsets" "model" "provider" "base_url" "workdir" "context_from"})
+
+(defn- bundle-config-text [home]
+  (let [p (h/join home "config.yaml")]
+    (when (h/file? p)
+      ;; drop host-local top-level blocks textually, so the bundle keeps the
+      ;; operator's formatting and comments for everything it does carry
+      (let [lines (str/split-lines (h/slurp p))]
+        (loop [[l & more] lines skip? false out []]
+          (if (nil? l)
+            (str (str/join "\n" out) "\n")
+            (let [top (second (re-matches #"^([A-Za-z_][A-Za-z0-9_-]*):.*$" l))]
+              (cond
+                top (if (host-local-config-keys top) (recur more true out) (recur more false (conj out l)))
+                skip? (recur more true out)
+                :else (recur more false (conj out l))))))))))
+
+(defn bundle-files
+  "path -> string content of what crosses to a peer: the profile's definition,
+  never its secrets, workspace, sessions, memories or run state."
+  [home {:keys [skills]}]
+  (let [f (fn [rel] (let [p (h/join home rel)] (when (h/file? p) [rel (h/slurp p)])))
+        jobs (read-jobs home)
+        scripts (->> (h/walk-files (h/join home "scripts") (fn [r] (or (str/includes? r "__pycache__") (str/starts-with? (h/basename r) "."))))
+                     (remove #(re-find #"\.(sh|bash)$" %))
+                     (map #(f (str "scripts/" %))))
+        skill-files (for [s skills
+                          r (h/walk-files (h/join home "skills" s) (fn [r] (str/starts-with? (h/basename r) ".")))]
+                      (f (str "skills/" s "/" r)))]
+    (into (sorted-map)
+          (remove nil?
+                  (concat [(f "SOUL.md") (f "profile.yaml") (f "itonami.edn")
+                           (when-let [c (bundle-config-text home)] ["config.yaml" c])
+                           ["cron/jobs.json" (h/json-str {"jobs" (mapv #(select-keys % job-definition-keys) (get jobs "jobs"))} 2)]]
+                          scripts skill-files)))))
+
+(defn bundle-manifest
+  "Sorted [path sha256] pairs; its CID names the bundle. itonami.edn is left
+  out of its own CID (it records the CID)."
+  [files]
+  (vec (for [[p c] files :when (not= p "itonami.edn")] [p (h/sha256-hex c)])))
+
+(defn bundle-cid [files]
+  (h/cid-raw (h/json-str (bundle-manifest files))))
+
+(defn verify-bundle
+  "true when files hash to cid."
+  [cid files]
+  (= cid (bundle-cid files)))
+
+;; ---------------------------------------------------------------- itonami.edn
+
+(defn- capabilities-from-yakuwari [home]
+  (when-let [y (try (read-edn-file (h/join home "yakuwari.edn")) (catch :default _ nil))]
+    (vec (for [c (:yakuwari/capabilities y)] (select-keys c [:capability :decision :note])))))
+
+(defn default-manifest
+  "The itonami.edn a Hermes profile gets when it joins the itonami plane.
+  Nothing here grants authority: capabilities are copied from yakuwari.edn
+  (which already decides them) and placement only says where a turn MAY run."
+  [p]
+  (let [home (:home p)
+        cron? (seq (get-in p [:jobs "jobs"]))
+        files (bundle-files home {})]
+    {:itonami/schema manifest-schema
+     :profile/id (:name p)
+     :profile/description (description p)
+     :profile/hermes-compatible true
+     :runtime {:engine :itonami-agent
+               ;; who ticks cron for this profile. :hermes until `adopt` hands it
+               ;; over, so the two schedulers never both fire one job
+               :scheduler :hermes}
+     :placement {:mode :p2p
+                 ;; a turn runs where its inference and tools are allowed to:
+                 ;; a trusted peer first (pulls the bundle by CID); local when none is available
+                 :order [:peer :local]
+                 :peers :trusted
+                 :inference-rail :murakumo}
+     :state {:workspace :host-local
+             :results :cid-receipts
+             :secrets :never-leave-host}
+     :bundle {:cid (bundle-cid files)
+              :files (count files)
+              :skills []}
+     :capabilities (or (capabilities-from-yakuwari home) [])
+     :cron? (boolean cron?)}))
+
+(defn write-manifest! [home m]
+  (h/spit-atomic (h/join home "itonami.edn")
+                 (str ";; itonami profile (" manifest-schema "). Additive to the Hermes layout:\n"
+                      ";; Hermes ignores this file; removing it returns the profile to plain Hermes.\n"
+                      (pr-str m) "\n")))
+
+(defn refresh-bundle-cid
+  "Recompute the bundle CID of an itonami profile (after its SOUL, config,
+  jobs or scripts changed) and write it back. Returns the manifest."
+  [home]
+  (let [m (read-edn-file (h/join home "itonami.edn"))
+        files (bundle-files home {:skills (get-in m [:bundle :skills])})
+        m (assoc m :bundle (merge (:bundle m) {:cid (bundle-cid files) :files (count files)}))]
+    (write-manifest! home m)
+    m))

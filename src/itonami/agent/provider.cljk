@@ -1,0 +1,116 @@
+(ns itonami.agent.provider
+  "OpenAI-compatible chat completions with the Hermes provider chain.
+
+  Resolution follows Hermes (cron/scheduler.py, hermes_cli/runtime_provider_custom.py):
+    model    : job pin -> cron.model -> model.default
+    provider : job pin -> cron.model_provider -> model.provider
+    chain    : [primary] ++ fallback_providers, unless the job pinned a model
+  A provider name resolves through config `providers.<name>` first, then the
+  built-in rails below. Every hop that fails (transport, non-2xx, an `error`
+  body, no choices) moves to the next; the last error is returned by name."
+  (:require [clojure.string :as str]
+            [promesa.core :as p]
+            [itonami.agent.host :as h]))
+
+(def built-in
+  {"kotoba"     {"base_url" "https://api.kotoba.cloud/v1"   "key_env" "KOTOBA_API_TOKEN"}
+   "murakumo"   {"base_url" "https://api.murakumo.cloud/v1" "key_env" "MURAKUMO_API_TOKEN"}
+   "openrouter" {"base_url" "https://openrouter.ai/api/v1"  "key_env" "OPENROUTER_API_KEY"}
+   "nous"       {"base_url" "https://inference-api.nousresearch.com/v1" "key_env" "NOUS_API_KEY"}
+   "openai"     {"base_url" "https://api.openai.com/v1"     "key_env" "OPENAI_API_KEY"}})
+
+(def default-headers
+  {"HTTP-Referer" "https://itonami.cloud"
+   "X-Title" "Itonami By KotobaLabs"})
+
+(defn resolve-hop
+  "One {provider model base_url key_env} entry -> a callable hop."
+  [config {:strs [provider model base_url key_env]}]
+  (let [pc (get-in config ["providers" provider])
+        bi (get built-in provider)
+        base (or base_url (get pc "base_url") (get bi "base_url")
+                 (when (= provider (get-in config ["model" "provider"])) (get-in config ["model" "base_url"])))
+        mc (get-in pc ["models" model])]
+    {:provider provider
+     :model model
+     :base-url (some-> base (str/replace #"/+$" ""))
+     :key-env (or key_env (get pc "key_env") (get pc "api_key_env") (get bi "key_env"))
+     :headers (merge default-headers (get pc "extra_headers"))
+     :extra-body (get pc "extra_body")
+     :timeout-s (or (get mc "timeout_seconds") (get pc "request_timeout_seconds") 900)}))
+
+(defn chain
+  "The ordered hops for a run. opts: {:model :provider :pinned?} from a job or
+  the CLI (-m / --provider)."
+  [config {:keys [model provider pinned?]}]
+  (let [m (or model (get-in config ["cron" "model"]) (get-in config ["model" "default"]))
+        pv (or provider (get-in config ["cron" "model_provider"]) (get-in config ["model" "provider"]))
+        primary (resolve-hop config {"provider" pv "model" m
+                                     "base_url" (when (= pv (get-in config ["model" "provider"]))
+                                                  (get-in config ["model" "base_url"]))})
+        fb (let [f (get config "fallback_providers")
+                 legacy (get config "fallback_model")]
+             (cond (sequential? f) f (map? legacy) [legacy] :else []))
+        fb (for [e fb :when (and (get e "provider") (get e "model"))] (resolve-hop config e))]
+    (vec (distinct (if pinned? [primary] (cons primary fb))))))
+
+(defn- fetch-json
+  [url {:keys [headers body timeout-s]}]
+  (let [ctrl (js/AbortController.)
+        t (js/setTimeout #(.abort ctrl) (* 1000 timeout-s))]
+    (-> (js/fetch url (clj->js {:method "POST" :headers headers :body body :signal (.-signal ctrl)}))
+        (p/then (fn [^js r] (p/let [txt (.text r)] {:status (.-status r) :text txt})))
+        (p/finally (fn [] (js/clearTimeout t))))))
+
+(defn- hop-error [hop status msg]
+  {:provider (:provider hop) :model (:model hop) :status status :error (subs (str msg) 0 (min 400 (count (str msg))))})
+
+(defn complete-hop
+  "One hop. Resolves to {:ok resp-map} or {:err {...}}."
+  [hop env {:keys [messages tools reasoning-effort max-tokens]}]
+  (if-not (:base-url hop)
+    (p/resolved {:err (hop-error hop nil "no base_url for provider")})
+    (let [key (when (:key-env hop) (get env (:key-env hop)))
+          headers (cond-> (merge {"Content-Type" "application/json"} (:headers hop))
+                    true (assoc "Authorization" (str "Bearer " (or key "no-key-required"))))
+          body (cond-> (merge (:extra-body hop) {"model" (:model hop) "messages" messages})
+                 (seq tools) (assoc "tools" tools)
+                 reasoning-effort (assoc "reasoning_effort" reasoning-effort)
+                 max-tokens (assoc "max_tokens" max-tokens))]
+      (-> (fetch-json (str (:base-url hop) "/chat/completions")
+                      {:headers headers :body (h/json-str body) :timeout-s (:timeout-s hop)})
+          (p/then (fn [{:keys [status text]}]
+                    (let [j (try (h/json-parse text) (catch :default _ nil))
+                          choice (first (get j "choices"))
+                          msg (get choice "message")]
+                      (cond
+                        (not (<= 200 status 299)) {:err (hop-error hop status (or (get-in j ["error" "message"]) (get j "error") text))}
+                        (get j "error") {:err (hop-error hop status (or (get-in j ["error" "message"]) (get j "error")))}
+                        (nil? msg) {:err (hop-error hop status (str "no choices: " (subs text 0 (min 200 (count text)))))}
+                        (and (str/blank? (get msg "content")) (empty? (get msg "tool_calls")))
+                        {:err (hop-error hop status "empty response")}
+                        :else {:ok {:message msg
+                                    :finish-reason (get choice "finish_reason")
+                                    :usage (get j "usage")
+                                    :model (or (get j "model") (:model hop))
+                                    :provider (:provider hop)}}))))
+          (p/catch (fn [e] {:err (hop-error hop nil (str "transport: " (.-message e)))}))))))
+
+(defn complete
+  "Walk the chain. Resolves to {:ok resp :attempts [...]} or {:err last :attempts [...]}.
+  req may carry :deadline-ms (epoch ms): each hop's timeout is capped at half
+  the time left (min 60 s), as Hermes caps its stale timeout by run budget.
+  :on-hop (fn [hop result-or-nil ms]) observes each hop."
+  [hops env {:keys [deadline-ms on-hop] :as req}]
+  (p/loop [[hop & more] hops attempts []]
+    (if (nil? hop)
+      {:err (or (last attempts) {:error "no provider configured"}) :attempts attempts}
+      (p/let [hop (if deadline-ms
+                    (update hop :timeout-s #(min % (max 60 (js/Math.floor (/ (- deadline-ms (h/now-ms)) 2000)))))
+                    hop)
+              t0 (h/now-ms)
+              r (complete-hop hop env req)
+              _ (when on-hop (on-hop hop r (- (h/now-ms) t0)))]
+        (if (:ok r)
+          (assoc r :attempts attempts)
+          (p/recur more (conj attempts (:err r))))))))
