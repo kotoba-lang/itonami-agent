@@ -105,8 +105,11 @@
   (p/loop [[hop & more] hops attempts attempts]
     (if (nil? hop)
       {:err (or (last attempts) {:error "no provider configured"}) :attempts attempts}
-      (p/let [hop (if deadline-ms
-                    (update hop :timeout-s #(min % (max 60 (js/Math.floor (/ (- deadline-ms (h/now-ms)) 2000)))))
+      (p/let [;; share the time left fairly among the hops still to try, so one
+              ;; slow rail cannot starve the fallbacks behind it
+              hop (if deadline-ms
+                    (update hop :timeout-s #(min % (max 60 (js/Math.floor (/ (- deadline-ms (h/now-ms))
+                                                                            (* 1000 (inc (count more))))))))
                     hop)
               t0 (h/now-ms)
               r (complete-hop hop env req)
@@ -117,8 +120,8 @@
 
 (defn complete
   "Walk the chain. Resolves to {:ok resp :attempts [...]} or {:err last :attempts [...]}.
-  req may carry :deadline-ms (epoch ms): each hop's timeout is capped at half
-  the time left (min 60 s), as Hermes caps its stale timeout by run budget.
+  req may carry :deadline-ms (epoch ms): each hop's timeout is capped at the
+  time left divided by the hops still to try in the round (min 60 s).
   When every hop of a round failed with a transient error (429 / 5xx /
   transport), wait and walk the chain again — up to :rounds (default 3) and
   only while the deadline leaves room — instead of failing the turn on a
