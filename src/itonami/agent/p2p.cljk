@@ -501,25 +501,35 @@
 (defn placement-executor
   "An executor (for cron/run-job and -z) that follows itonami.edn :placement
   :order, e.g. [:peer :local]: try a trusted peer, fall back to local. A
-  profile without itonami.edn always runs locally."
+  profile without itonami.edn always runs locally. The result carries
+  :placement, the trail of every step tried."
   [{:keys [origin-url force-peer?]}]
   (fn [prof prompt opts]
     (let [order (if force-peer? [:peer] (get-in prof [:itonami :placement :order] [:local]))
-          cid (get-in prof [:itonami :bundle :cid])]
-      (p/loop [[step & more] order last-r nil]
+          cid (get-in prof [:itonami :bundle :cid])
+          step-rec (fn [step r] (cond-> {"step" (name step) "exit_reason" (:exit-reason r)}
+                                  (:peer r) (assoc "peer" (:peer r))
+                                  (get-in r [:error :error]) (assoc "error" (subs (str (get-in r [:error :error])) 0 (min 200 (count (str (get-in r [:error :error]))))))))]
+      (p/loop [[step & more] order last-r nil trail []]
         (cond
-          (nil? step) (or last-r {:final nil :exit-reason "no_placement" :error {:error "no placement step could run the turn"} :turns 0 :attempts []})
+          (nil? step) (assoc (or last-r {:final nil :exit-reason "no_placement" :error {:error "no placement step could run the turn"} :turns 0 :attempts []})
+                             :placement trail)
 
           (= step :local)
-          (p/let [r (agent-loop/run prof prompt opts)]
-            (if (and (= "provider_error" (:exit-reason r)) (seq more)) (p/recur more r) r))
+          (p/let [r (agent-loop/run prof prompt opts)
+                  trail (conj trail (step-rec :local r))]
+            (if (and (= "provider_error" (:exit-reason r)) (seq more)) (p/recur more r trail) (assoc r :placement trail)))
 
           (= step :peer)
           (p/let [infos (discover)
                   peer (pick-peer infos cid)]
             (if-not peer
-              (p/recur more (or last-r {:final nil :exit-reason "no_peer" :error {:error "no trusted peer available"} :turns 0 :attempts []}))
-              (p/let [r (remote-run prof prompt opts peer {:origin-url origin-url})]
-                (if (and (#{"peer_error" "provider_error"} (:exit-reason r)) (seq more)) (p/recur more r) r))))
+              (p/recur more (or last-r {:final nil :exit-reason "no_peer" :error {:error "no trusted peer available"} :turns 0 :attempts []})
+                       (conj trail {"step" "peer" "exit_reason" "no_peer"}))
+              (p/let [r (remote-run prof prompt opts peer {:origin-url origin-url})
+                      trail (conj trail (step-rec :peer r))]
+                (if (and (#{"peer_error" "provider_error"} (:exit-reason r)) (seq more))
+                  (p/recur more r trail)
+                  (assoc r :placement trail)))))
 
-          :else (p/recur more last-r))))))
+          :else (p/recur more last-r trail))))))

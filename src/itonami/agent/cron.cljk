@@ -211,7 +211,7 @@
        "**Job ID:** " (get job "id") "\n"
        "**Run Time:** " (h/human-time at) "\n"
        "**Schedule:** " (or (get job "schedule_display") (get-in job ["schedule" "display"])) "\n"
-       (when status-line (str status-line "\n"))
+       (when-not (str/blank? status-line) (str status-line "\n"))
        "**Engine:** itonami-agent\n"
        "\n## Prompt\n\n" (or prompt "") "\n\n## Response\n\n"
        (if (str/blank? response) "(No response generated)" response) "\n"))
@@ -256,7 +256,9 @@
               doc (output-doc job {:prompt prompt
                                    :response (if failed? (str (or final "") (when err (str "\n\n## Error\n\n```\n" err "\n```"))) final)
                                    :failed? failed?
-                                   :status-line (when (:peer r) (str "**Peer:** " (:peer r)))}
+                                   :status-line (str/join "\n" (remove nil? [(when (:peer r) (str "**Peer:** " (:peer r)))
+                                                                         (when (seq (:placement r))
+                                                                           (str "**Placement:** " (str/join " → " (map #(str (get % "step") ":" (get % "exit_reason")) (:placement r)))))]))}
                               started)
               f (save-output! home job doc started)
               finished (js/Date.)]
@@ -282,7 +284,7 @@
                   (str (h/json-str {"ts" (h/iso-local finished true) "job_id" (get job "id") "manual" (boolean manual?)
                                     "status" (cond failed? "error" silent? "silent" :else "ok")
                                     "exit_reason" (:exit-reason r) "turns" (:turns r) "provider" (:provider r) "model" (:model r)
-                                    "peer" (:peer r) "receipt" (:receipt r)
+                                    "peer" (:peer r) "receipt" (:receipt r) "placement" (:placement r)
                                     "attempts" (mapv #(select-keys % [:provider :model :status :error]) (:attempts r))
                                     "output" f}) "\n")
                   {:append? true})
