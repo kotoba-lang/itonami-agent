@@ -155,6 +155,34 @@ finds the node's llama-server on `127.0.0.1:18094`. Trust is a full mesh in
 each node's `~/.itonami/peers.edn`. `ITONAMI_PEER_PORT` moves the port (serve
 and the `itonami-p2p` rail) on a node where 7420 is taken.
 
+## System One Coding (kotoba-harness)
+
+itonami-agent can assemble typed kotoba functions with
+[kotoba-lang/kotoba-harness](https://github.com/kotoba-lang/kotoba-harness):
+TypeSafe Jev chooses typed blocks one hole at a time (never source text), the
+harness emits kotoba typed-subset source, and kotoba verifies each function
+(`kotoba -M check`, then the module plus fixed exhaustive checks compiled to
+wasm32-browser and run through `instantiateKotoba`). The search backtracks
+outward when the policy reports that no candidate fits.
+
+`system-one/loop.edn` encodes the run-loop rules of `src/itonami/agent/loop.cljk` — stop at `max_turns`, `budget_exhausted` when `elapsed > run_budget` (budget > 0), and the wrap-up notice at 80% of the budget (`5·elapsed > 4·budget`) — as `turn-allowed`, `budget-exhausted`, `wrap-up` and `may-continue` (11 812 exhaustive cases; checks use
+independently written oracles). The harness commit is pinned in
+`kotoba-harness.pin.edn` and fetched into
+`${XDG_CACHE_HOME:-~/.cache}/kotoba-harness/<sha>`, outside this repository
+(override with `KOTOBA_HARNESS_HOME`).
+
+```sh
+sh bin/itonami-system-one validate   # offline: shape, catalog, baseline splice
+sh bin/itonami-system-one known      # kotoba verification of known-correct bodies
+sh bin/itonami-system-one wrong      # negative control (rejected)
+OPENROUTER_API_KEY=... sh bin/itonami-system-one jev
+```
+
+`known`/`wrong`/`jev` need a kotoba CLI that provides `-M check` and
+`-M compile --target wasm32-browser`, and `KOTOBA_BROWSER_HOST` pointing at
+amu's `runtime/browser-host.mjs`. `jev` spends OpenRouter credit (about a tenth
+of a cent per run). Receipts land in `target/system-one/`.
+
 ## Tests
 
 ```

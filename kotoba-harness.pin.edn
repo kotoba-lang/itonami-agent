@@ -1,0 +1,6 @@
+;; kotoba-lang/kotoba-harness commit used by bin/itonami-system-one.
+;; f18d514: per-function verification, outward backtracking on stop,
+;; kotoba-only verification (check + wasm32-browser + instantiateKotoba),
+;; offline validate mode.
+{:repo "https://github.com/kotoba-lang/kotoba-harness.git"
+ :sha "f18d5147ac2aefce2100f5223d262112fbb20e93"}
