@@ -56,6 +56,15 @@ plain: true
       (is (= 1 (count (provider/chain cfg {:model "x" :provider "kotoba" :pinned? true})))))
     (is (= "MURAKUMO_API_TOKEN" (:key-env (second (provider/chain cfg {})))))))
 
+(deftest decentralized-chain
+  (let [hops [{:provider "kotoba" :base-url "https://api.kotoba.cloud/v1"}
+              {:provider "openrouter-free" :base-url "https://openrouter.ai/api/v1"}
+              {:provider "itonami-p2p" :base-url "http://127.0.0.1:7420/v1"}]]
+    (is (= ["kotoba" "itonami-p2p"] (map :provider (provider/decentralize hops {:itonami/schema "x"}))))
+    (is (= 3 (count (provider/decentralize hops nil))) "plain Hermes profiles keep their chain")
+    (is (= ["itonami-p2p" "murakumo"]
+           (map #(get % "provider") (get (p2p/ensure-rail {"model" {"provider" "kotoba"}} "murakumo") "fallback_providers"))))))
+
 (deftest cron-next-fire
   (let [d (js/Date. 2026 9 7 13 0 0)]                      ; 2026-10-07 13:00 local
     (is (= [2026 9 7 17 30] ((juxt #(.getFullYear %) #(.getMonth %) #(.getDate %) #(.getHours %) #(.getMinutes %))

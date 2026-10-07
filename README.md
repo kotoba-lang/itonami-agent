@@ -85,12 +85,41 @@ requester (node A)                               peer (node B)
   is the boundary. The four conditions of ADR-2609242300 (gVisor/rootless
   isolation, tunnel, cross-node resume, secret isolation) are still open.
 
+### Decentralised inference (no third-party relay)
+
+Every node brings its own inference rails and lends them to trusted peers.
+
+```
+any OpenAI client on node A (itonami-agent, Hermes)
+  provider itonami-p2p  base_url http://127.0.0.1:7420/v1      (loopback only)
+        │
+        ├─ A's own rails  ~/.itonami/rails.edn   (llama-server, mlx_lm, Ollama,
+        │                                         murakumo mishima-local-router over the mesh)
+        └─ trusted peers  POST /itonami/v1/infer (signed envelope) ──▶ B's own rails only
+                                                  ◀── signed response   (never forwarded onward)
+```
+
+- `peer rails detect` probes loopback for OpenAI-compatible servers and
+  writes `rails.edn`; models too small for tool calling (≈1B and below) are
+  marked `:agent? false` and used only when named exactly. `model: auto` picks
+  the first agent-capable rail.
+- `/peer` advertises `models` / `agent_models`, so gossip tells a node which
+  peer can answer which model.
+- For an itonami profile, hops whose base URL is a relay in
+  `:inference :deny-hosts` (default `openrouter.ai`) are dropped from the
+  chain; a profile without `itonami.edn` keeps its Hermes chain. Turns run for
+  a peer always get `itonami-p2p` on their chain.
+- Operator rails (kotoba, murakumo cloud) stay as later hops; a profile can
+  drop them too by listing their hosts in `:deny-hosts`.
+
 ### murakumo
 
 murakumo today is hub-and-spoke: nodes poll `api.murakumo.cloud` for
 inference jobs, and it has no generic agent-step job kind. itonami-agent
 uses murakumo as the shared inference rail (`murakumo/free`, `mishima`) and
-keeps agent execution on its own peer protocol. Making agent turns a
+keeps agent execution on its own peer protocol. The
+mesh path (`mishima-local-router` on a node, straight to fleet llama-servers
+over tailscale) is used as a node-owned rail, without `api.murakumo.cloud`. Making agent turns a
 murakumo job kind is a change on the murakumo side (`poll_worker.cljk`) and
 not done here.
 

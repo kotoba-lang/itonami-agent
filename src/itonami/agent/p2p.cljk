@@ -34,6 +34,7 @@
             [itonami.agent.host :as h]
             [itonami.agent.profile :as profile]
             [itonami.agent.loop :as agent-loop]
+            [itonami.agent.rails :as rails]
             ["node:crypto" :as crypto]
             ["node:child_process" :as cp]
             ["node:http" :as http]))
@@ -238,15 +239,16 @@
          (let [f (h/join (itonami-dir) "peer.env")] (when (h/file? f) (profile/parse-dotenv (h/slurp f))))))
 
 (defn ensure-rail
-  "Put the named inference rail (murakumo) at the end of the fallback chain
-  if the profile's config does not already name it, so a peer run always has
-  the shared rail to fall back to."
+  "A turn run for a peer always has the decentralised rail on its chain:
+  itonami-p2p (this node's own rails, then its trusted peers'), then the
+  named operator rail (murakumo) — appended when the profile's config does
+  not already name them."
   [config rail]
-  (if (or (nil? rail) (= rail (get-in config ["model" "provider"]))
-          (some #(= rail (get % "provider")) (get config "fallback_providers")))
-    config
-    (update config "fallback_providers" (fnil conj [])
-            {"provider" rail "model" (if (= rail "murakumo") "murakumo/free" "default")})))
+  (let [has? (fn [c r] (or (= r (get-in c ["model" "provider"]))
+                           (some #(= r (get % "provider")) (get c "fallback_providers"))))
+        add (fn [c r m] (if (has? c r) c (update c "fallback_providers" (fnil conj []) {"provider" r "model" m})))]
+    (cond-> (add config "itonami-p2p" "auto")
+      (and rail (not= rail "itonami-p2p")) (add rail (if (= rail "murakumo") "murakumo/free" "auto")))))
 
 (defn rebase-paths
   "The requester's prompt and SOUL name paths in ITS profile home
@@ -278,7 +280,7 @@
           prof (-> (profile/load-profile* home profile)
                    (assoc :env (peer-env))
                    (update :soul rebase-paths paths)
-                   (update :config ensure-rail (get opts "inference_rail" "murakumo")))
+                   (update :config ensure-rail (get opts "inference_rail" "itonami-p2p")))
           r (agent-loop/run prof (rebase-paths prompt paths) {:platform (get opts "platform" "peer")
                                          :toolsets (get opts "toolsets")
                                          :model (get opts "model") :provider (get opts "provider")
@@ -336,6 +338,63 @@
 (def ^:private active-runs (atom 0))
 (def ^:private runs (atom {}))
 
+(defn- loopback? [^js req]
+  (contains? #{"127.0.0.1" "::1" "::ffff:127.0.0.1"} (.. req -socket -remoteAddress)))
+
+(declare discover)
+
+(def ^:private peer-cache (atom {:at 0 :infos []}))
+
+(defn- cached-peers
+  "discover, at most once a minute (the inference path must not gossip per token)."
+  []
+  (if (< (- (h/now-ms) (:at @peer-cache)) 60000)
+    (p/resolved (:infos @peer-cache))
+    (p/let [infos (discover)] (reset! peer-cache {:at (h/now-ms) :infos infos}) infos)))
+
+(defn- infer-peers
+  "Trusted, reachable peers that lend a model for this request, least loaded first."
+  [infos model]
+  (let [{:keys [trusted]} (read-peers)
+        me (:did (node-key))
+        auto? (or (str/blank? model) (= model "auto"))]
+    (->> infos
+         (filter #(and (not (:error %)) (contains? trusted (:did %)) (not= me (:did %))
+                       (if auto? (seq (get % "agent_models")) (some #{model} (get % "models")))))
+         (sort-by #(get % "load" 0)))))
+
+(defn infer-via-peers
+  "Ask trusted peers to answer body from THEIR own rails. Resolves to
+  {:status :text :peer} of the first that answered, or the last failure."
+  [node body]
+  (p/let [infos (cached-peers)]
+    (p/loop [[peer & more] (infer-peers infos (get body "model"))
+             last-err {:status 503 :text (h/json-str {"error" "no trusted peer lends this model"})}]
+      (if (nil? peer)
+        last-err
+        (p/let [r (-> (http-json (str (:url peer) "/itonami/v1/infer")
+                                 {:method "POST" :timeout-s 900
+                                  :body (h/json-str (sign-envelope node {"body" body}))})
+                      (p/catch (fn [e] {:status 0 :text (.-message e)})))
+                env (when (= 200 (:status r)) (open-envelope (:body r) {:trusted #{(:did peer)}}))
+                resp (get-in env [:payload "response"])]
+          (if (and resp (not (:error env)))
+            {:status 200 :text resp :peer (:did peer) :rail (get-in env [:payload "rail"])}
+            (p/recur more (assoc r :peer (:did peer)))))))))
+
+(defn local-gateway-complete
+  "The OpenAI-compatible endpoint a node offers ITSELF on loopback: own rails
+  first, then trusted peers' rails. Any OpenAI client (itonami-agent, Hermes)
+  uses it as provider base_url http://127.0.0.1:<port>/v1."
+  [node body]
+  (p/let [own (rails/complete (rails/read-rails) body {})]
+    (if (<= 200 (:status own) 299)
+      (assoc own :route (str "self:" (:rail own)))
+      (p/let [via (infer-via-peers node body)]
+        (if (= 200 (:status via))
+          (assoc via :route (str "peer:" (:peer via) ":" (:rail via)))
+          via)))))
+
 (defn serve
   "Start the peer server. Resolves to the http server."
   [{:keys [port host max-runs public-url]}]
@@ -353,8 +412,45 @@
                                                          "murakumo_did" (h/env "MURAKUMO_NODE_DID")
                                                          "load" @active-runs "max_runs" max-runs
                                                          "rails" (rails-available)
+                                                         ;; models this node lends from its own rails
+                                                         "models" (rails/all-models (rails/read-rails))
+                                                         "agent_models" (rails/agent-models (rails/read-rails))
                                                          "profiles" (local-itonami-profiles)
                                                          "peers" (mapv :url peers)})))
+
+                   ;; ---- inference: OpenAI-compatible, loopback only
+                   (and (= method "GET") (= url "/v1/models"))
+                   (if-not (loopback? req)
+                     (reply res 403 {"error" "loopback only"})
+                     (p/let [infos (cached-peers)
+                             {:keys [trusted]} (read-peers)
+                             own (rails/all-models (rails/read-rails))
+                             lent (mapcat #(get % "models") (filter #(contains? trusted (:did %)) infos))]
+                       (reply res 200 {"object" "list"
+                                       "data" (vec (for [m (distinct (concat ["auto"] own lent))]
+                                                     {"id" m "object" "model" "owned_by" "itonami-p2p"}))})))
+
+                   (and (= method "POST") (= url "/v1/chat/completions"))
+                   (if-not (loopback? req)
+                     (reply res 403 {"error" "loopback only; peers use /itonami/v1/infer"})
+                     (p/let [body (read-body req)
+                             r (local-gateway-complete node (h/json-parse body))]
+                       (println (str (h/iso-local) " infer " (or (:route r) (str "failed " (:status r)))))
+                       (.writeHead res (if (pos? (:status r)) (:status r) 502)
+                                   #js {"Content-Type" "application/json" "X-Itonami-Route" (str (:route r))})
+                       (.end res (:text r))))
+
+                   ;; ---- inference lent to a trusted peer: own rails only, never onward
+                   (and (= method "POST") (= url "/itonami/v1/infer"))
+                   (p/let [body (read-body req)
+                           env (open-envelope (try (h/json-parse body) (catch :default _ {})) (read-peers))]
+                     (if (:error env)
+                       (reply res 403 {"error" (:error env)})
+                       (p/let [r (rails/complete (rails/read-rails) (get-in env [:payload "body"]) {})]
+                         (println (str (h/iso-local) " lend " (:did env) " " (:rail r) " " (:status r)))
+                         (if (<= 200 (:status r) 299)
+                           (reply res 200 (sign-envelope node {"response" (:text r) "rail" (:rail r)}))
+                           (reply res 502 {"error" (str "own rails failed: " (:status r))})))))
 
                    (and (= method "GET") (str/starts-with? url "/itonami/v1/bundle/"))
                    (let [cid (subs url (count "/itonami/v1/bundle/"))

@@ -17,7 +17,9 @@
    "murakumo"   {"base_url" "https://api.murakumo.cloud/v1" "key_env" "MURAKUMO_API_TOKEN"}
    "openrouter" {"base_url" "https://openrouter.ai/api/v1"  "key_env" "OPENROUTER_API_KEY"}
    "nous"       {"base_url" "https://inference-api.nousresearch.com/v1" "key_env" "NOUS_API_KEY"}
-   "openai"     {"base_url" "https://api.openai.com/v1"     "key_env" "OPENAI_API_KEY"}})
+   "openai"     {"base_url" "https://api.openai.com/v1"     "key_env" "OPENAI_API_KEY"}
+   ;; this node's own peer server: own rails, then trusted peers' rails
+   "itonami-p2p" {"base_url" "http://127.0.0.1:7420/v1"}})
 
 (def default-headers
   {"HTTP-Referer" "https://itonami.cloud"
@@ -53,6 +55,23 @@
              (cond (sequential? f) f (map? legacy) [legacy] :else []))
         fb (for [e fb :when (and (get e "provider") (get e "model"))] (resolve-hop config e))]
     (vec (distinct (if pinned? [primary] (cons primary fb))))))
+
+(def default-deny-hosts
+  "Third-party relays an itonami profile does not depend on. A rail must be
+  owned by a node (its own server, its mesh, a trusted peer) or by the
+  operator (kotoba, murakumo)."
+  ["openrouter.ai"])
+
+(defn decentralize
+  "Drop hops whose base URL is a denied relay host. Applies to itonami
+  profiles (manifest present); :inference :deny-hosts overrides the default.
+  A profile without itonami.edn keeps its Hermes chain unchanged."
+  [hops manifest]
+  (if-not manifest
+    hops
+    (let [deny (get-in manifest [:inference :deny-hosts] default-deny-hosts)
+          kept (vec (remove (fn [hop] (some #(str/includes? (str (:base-url hop)) %) deny)) hops))]
+      (if (seq kept) kept hops))))
 
 (defn- fetch-json
   [url {:keys [headers body timeout-s]}]

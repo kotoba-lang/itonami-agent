@@ -190,7 +190,11 @@
                  ;; a trusted peer first (pulls the bundle by CID); local when none is available
                  :order [:peer :local]
                  :peers :trusted
-                 :inference-rail :murakumo}
+                 :inference-rail :itonami-p2p}
+     ;; rails a turn may use: this node's / peers' own servers first, the
+     ;; operator rails after; third-party relays are dropped from the chain
+     :inference {:rails [:itonami-p2p :kotoba :murakumo]
+                 :deny-hosts ["openrouter.ai"]}
      :state {:workspace :host-local
              :results :cid-receipts
              :secrets :never-leave-host}

@@ -1,0 +1,107 @@
+(ns itonami.agent.rails
+  "Inference rails a node owns — OpenAI-compatible servers it runs itself or
+  reaches on its own mesh (a llama-server, mlx_lm.server, Ollama, LM Studio,
+  the murakumo mishima-local-router over tailscale). No third-party relay:
+  the decentralised alternative to a hosted aggregator is that every node
+  brings its own rail and lends it to trusted peers.
+
+  ~/.itonami/rails.edn
+    {:local [{:name \"mishima-mesh\" :base-url \"http://127.0.0.1:8095/v1\"
+              :models [\"mishima\" \"murakumo/free\"] :priority 0 :agent? true}
+             ...]}
+
+  :agent? false marks a rail too small for tool-calling agent turns (e.g. a
+  0.6B model); it is served only when a request names its model exactly."
+  (:require [clojure.string :as str]
+            [cljs.reader :as reader]
+            [promesa.core :as p]
+            [itonami.agent.host :as h]))
+
+(defn itonami-dir [] (h/expand (or (h/env "ITONAMI_DIR") "~/.itonami")))
+(defn rails-file [] (h/join (itonami-dir) "rails.edn"))
+
+(defn read-rails []
+  (let [f (rails-file)]
+    (merge {:local []} (when (h/file? f) (reader/read-string (h/slurp f))))))
+
+(defn write-rails! [m]
+  (h/spit-atomic (rails-file)
+                 (str ";; itonami-agent inference rails this node owns. Served to itself on\n"
+                      ";; 127.0.0.1:<peer port>/v1 and to trusted peers on /itonami/v1/infer.\n"
+                      (pr-str m) "\n")))
+
+(def candidate-ports
+  "Where local OpenAI-compatible servers usually listen."
+  [8095 8094 18195 11434 1234 8000 8001 8080 8081 5000 18194])
+
+(defn- fetch-text [url {:keys [method body timeout-s headers]}]
+  (let [ctrl (js/AbortController.)
+        t (js/setTimeout #(.abort ctrl) (* 1000 (or timeout-s 5)))]
+    (-> (js/fetch url (clj->js (cond-> {:method (or method "GET") :signal (.-signal ctrl)
+                                        :headers (merge {"Content-Type" "application/json"} headers)}
+                                 body (assoc :body body))))
+        (p/then (fn [^js r] (p/let [t (.text r)] {:status (.-status r) :text t})))
+        (p/finally #(js/clearTimeout t)))))
+
+(defn probe
+  "GET <base>/models -> model ids, or nil when nothing OpenAI-shaped answers."
+  [base-url]
+  (-> (fetch-text (str base-url "/models") {:timeout-s 3})
+      (p/then (fn [{:keys [status text]}]
+                (when (= 200 status)
+                  (let [ids (try (mapv #(get % "id") (get (h/json-parse text) "data")) (catch :default _ nil))]
+                    (when (seq ids) ids)))))
+      (p/catch (fn [_] nil))))
+
+(defn- small-model? [ids]
+  (every? #(re-find #"(?i)(0\.[0-9]+b|1\.?[0-9]?b)\b|-0\.6b|-1b" (str %)) ids))
+
+(defn detect
+  "Probe candidate-ports on loopback. Resolves to a rails map (not written).
+  The port this node's own peer server uses is skipped (it is not a rail)."
+  [{:keys [skip-port]}]
+  (p/let [found (p/all (for [port candidate-ports :when (not= port skip-port)
+                             :let [base (str "http://127.0.0.1:" port "/v1")]]
+                         (p/let [ids (probe base)] (when ids [port base ids]))))]
+    {:local (vec (map-indexed
+                  (fn [i [port base ids]]
+                    (let [ids (vec (remove #(str/starts-with? (str %) "/") ids))]
+                      {:name (str "local-" port) :base-url base :models ids
+                       :priority (if (small-model? ids) (+ 100 i) i)
+                       :agent? (not (small-model? ids))}))
+                  (remove nil? found)))}))
+
+(defn all-models [rails]
+  (vec (distinct (mapcat :models (:local rails)))))
+
+(defn agent-models [rails]
+  (vec (distinct (mapcat :models (filter :agent? (:local rails))))))
+
+(defn- candidates
+  "Rails that can answer `model`, best first. \"auto\" / blank / unknown model
+  -> every agent-capable rail, each with its own first model."
+  [rails model]
+  (let [rs (sort-by :priority (:local rails))
+        exact (filter #(some #{model} (:models %)) rs)]
+    (if (seq exact)
+      (map #(assoc % :use-model model) exact)
+      (for [r rs :when (:agent? r)] (assoc r :use-model (first (:models r)))))))
+
+(defn complete
+  "Forward an OpenAI chat-completions body (a map) to this node's own rails.
+  Resolves to {:status :text :rail} of the first rail that answered 2xx with
+  choices, or the last failure."
+  [rails body {:keys [timeout-s]}]
+  (p/loop [[r & more] (candidates rails (get body "model")) last-err {:status 503 :text "{\"error\":\"no local rail for this model\"}"}]
+    (if (nil? r)
+      last-err
+      (p/let [res (-> (fetch-text (str (:base-url r) "/chat/completions")
+                                  {:method "POST" :timeout-s (or timeout-s 600)
+                                   :headers (when-let [k (some-> (:key-env r) h/env)] {"Authorization" (str "Bearer " k)})
+                                   :body (h/json-str (assoc body "model" (:use-model r)))})
+                      (p/catch (fn [e] {:status 0 :text (h/json-str {"error" (str "transport: " (.-message e))})})))
+              ok? (and (<= 200 (:status res) 299)
+                       (seq (get (try (h/json-parse (:text res)) (catch :default _ {})) "choices")))]
+        (if ok?
+          (assoc res :rail (:name r))
+          (p/recur more (assoc res :rail (:name r))))))))
