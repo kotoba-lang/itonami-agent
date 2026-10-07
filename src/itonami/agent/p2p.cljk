@@ -506,8 +506,8 @@
                  (p/catch (fn [e] (try (reply res 500 {"error" (.-message e)}) (catch :default _ nil))))))))]
     ;; On a host whose ephemeral port range reaches below our port (a fleet
     ;; sysctl baseline sets 1024-65535), an outbound connection can sit in
-    ;; TIME_WAIT on :port. reusePort lets the listener bind anyway; if the OS
-    ;; still refuses, wait it out and retry rather than exit.
+    ;; TIME_WAIT on :port (macOS has no SO_REUSEPORT for node: ENOTSUP). Wait
+    ;; it out and retry rather than exit.
     (js/Promise. (fn [resolve reject]
                    (let [attempt (fn attempt [n]
                                    (.once server "error"
@@ -516,7 +516,7 @@
                                               (do (println (str (h/iso-local) " :" port " busy (" (.-code e) "), retry " (inc n)))
                                                   (js/setTimeout #(attempt (inc n)) 5000))
                                               (reject e))))
-                                   (.listen server #js {:port port :host (or host "0.0.0.0") :reusePort true}
+                                   (.listen server #js {:port port :host (or host "0.0.0.0")}
                                             #(resolve {:server server :did (:did node) :port port})))]
                      (attempt 0))))))
 
