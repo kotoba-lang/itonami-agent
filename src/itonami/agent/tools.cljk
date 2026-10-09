@@ -98,6 +98,19 @@
   (or (nil? (:roots ctx))
       (some #(or (= abs %) (str/starts-with? abs (str % "/"))) (:roots ctx))))
 
+(defn- policy [ctx] (or (:terminal-policy ctx) (confine/policy nil {})))
+(defn- host-home [ctx] (or (:host-home ctx) (h/home-dir)))
+(defn- backend [ctx] (if (contains? ctx :sandbox-backend) (:sandbox-backend ctx) (confine/backend)))
+
+(defn- read-roots
+  "Readable under :roots scope: the run's roots plus the profile home it runs
+  from (on a peer, the materialized bundle: SOUL, data/, skills)."
+  [ctx]
+  (vec (distinct (remove nil? (concat (or (:roots ctx) [(:cwd ctx)]) [(:home ctx)])))))
+
+(defn- readable? [ctx abs]
+  (confine/readable? (policy ctx) {:path abs :roots (read-roots ctx) :home (host-home ctx)}))
+
 (defn- record-write! [ctx abs]
   (when-let [w (:writes ctx)] (swap! w conj abs)))
 
@@ -111,14 +124,15 @@
   no secret stores, no network unless granted, only the env it names."
   [ctx {:strs [command timeout workdir]}]
   (let [cwd (if workdir (resolve-path ctx workdir) (:cwd ctx))
-        pol (or (:terminal-policy ctx) (confine/policy nil {}))]
+        pol (policy ctx)]
     (if (and (:roots ctx) (not (writable? ctx cwd)))
       (err (str "workdir outside this run's roots: " cwd))
       (let [c (confine/command pol {:cmd (str command)
                                     :write-roots (or (:roots ctx) [(:cwd ctx)])
+                                    :read-roots (read-roots ctx)
                                     :tool-env (:tool-env ctx)
-                                    :home (or (:host-home ctx) (h/home-dir))
-                                    :backend (if (contains? ctx :sandbox-backend) (:sandbox-backend ctx) (confine/backend))})]
+                                    :home (host-home ctx)
+                                    :backend (backend ctx)})]
         (if-let [why (:refused c)]
           (err (str "terminal refused: " why))
           (let [r (try (h/run-process (:argv c) {:cwd cwd :exact-env? true :env (:env c)
@@ -134,8 +148,11 @@
 
 (defn read-file [ctx {:strs [path offset limit]}]
   (let [abs (resolve-path ctx path)]
-    (if-not (h/file? abs)
-      (err (str "file not found: " abs))
+    (cond
+      ;; checked before existence, so a denied path does not leak whether it exists
+      (not (readable? ctx abs)) (err (str "path not readable under this run's policy: " abs))
+      (not (h/file? abs)) (err (str "file not found: " abs))
+      :else
       (let [ls (str/split-lines (h/slurp abs))
             off (max 1 (or offset 1))
             lim (min 2000 (or limit 2000))
@@ -167,19 +184,31 @@
                     (record-write! ctx abs)
                     (ok {"replacements" (if replace_all n 1) "path" abs})))))))
 
-(defn search-files [ctx {:strs [pattern target path file_glob limit]}]
+(defn search-files
+  "rg / grep / find, run under the same sandbox as `terminal` (read-only,
+  offline), so a search over a broad path cannot read the secret stores
+  inside it -- and under :roots scope nothing in the home directory but the
+  run's roots."
+  [ctx {:strs [pattern target path file_glob limit]}]
   (let [dir (resolve-path ctx (or path "."))
-        lim (or limit 50)
-        rg? (zero? (:exit (h/run-process ["which" "rg"] {})))
-        r (if (= target "files")
-            (if rg?
-              (h/run-process ["rg" "--files" "-g" pattern dir] {:timeout-ms 30000})
-              (h/run-process ["find" dir "-name" pattern] {:timeout-ms 30000}))
-            (if rg?
-              (h/run-process (cond-> ["rg" "-n" "--no-heading" "-m" "20"] file_glob (into ["-g" file_glob]) true (into ["-e" pattern dir])) {:timeout-ms 30000})
-              (h/run-process ["grep" "-rnE" pattern dir] {:timeout-ms 30000})))
-        hits (take lim (remove str/blank? (str/split-lines (:stdout r))))]
-    (ok {"matches" (vec hits) "count" (count hits)})))
+        lim (or limit 50)]
+    (if-not (readable? ctx dir)
+      (err (str "path not readable under this run's policy: " dir))
+      (let [rg? (zero? (:exit (h/run-process ["which" "rg"] {})))
+            argv (if (= target "files")
+                   (if rg? ["rg" "--files" "-g" pattern dir] ["find" dir "-name" pattern])
+                   (if rg?
+                     (cond-> ["rg" "-n" "--no-heading" "-m" "20"] file_glob (into ["-g" file_glob]) true (into ["-e" pattern dir]))
+                     ["grep" "-rnE" pattern dir]))
+            c (confine/command (assoc (policy ctx) :network? false :write-extra [])
+                               {:argv argv :write-roots [] :read-roots (read-roots ctx)
+                                :tool-env {} :home (host-home ctx) :backend (backend ctx)})]
+        (if-let [why (:refused c)]
+          (err (str "search_files refused: " why))
+          (let [r (try (h/run-process (:argv c) {:exact-env? true :env (:env c) :timeout-ms 30000})
+                       (finally (when (:tmpdir c) (h/rm (:tmpdir c)))))
+                hits (take lim (remove str/blank? (str/split-lines (:stdout r))))]
+            (ok {"matches" (vec hits) "count" (count hits)})))))))
 
 (defn- strip-html [html]
   (-> html

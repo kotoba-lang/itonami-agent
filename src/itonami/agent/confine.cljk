@@ -1,10 +1,14 @@
 (ns itonami.agent.confine
-  "The OS boundary around `terminal`. A shell command an LLM wrote runs
-  with what its policy grants and nothing else:
+  "The OS boundary around the tools that touch the host: `terminal`,
+  `read_file` and `search_files`. What an LLM asked for runs with what its
+  policy grants and nothing else:
 
     writes   only the run's write roots and a per-run TMPDIR
     reads    everything except the host's secret stores (ssh/cloud/gpg keys,
-             keychains, the node key, every .env / peer.env / secrets file)
+             keychains, the node key, every .env / peer.env / secrets file);
+             a turn run for a peer reads nothing under the home directory
+             but its own roots and the toolchains on PATH, and gets the
+             per-run TMPDIR as HOME
     network  none unless granted
     env      PATH/HOME/locale/TERM + the profile secrets named in :env
 
@@ -53,7 +57,48 @@
      :network? (boolean (and (not peer?) (:network t)))
      :env-allow (vec (when-not peer? (:env t)))
      :write-extra (vec (when-not peer? (map h/expand (:write t))))
+     ;; :all-but-secrets | :roots (home-dir reads limited to the run's roots)
+     :read-scope (if peer? :roots :all-but-secrets)
      :peer? (boolean peer?)}))
+
+(defn- under? [p dir] (or (= p dir) (str/starts-with? p (str dir "/"))))
+
+(defn- real [p] (try (h/realpath p) (catch :default _ p)))
+
+(defn- real-or-parent
+  "realpath of p, or of its nearest existing ancestor joined with the rest,
+  so a path that does not exist yet is judged where it would land."
+  [p]
+  (if (h/exists? p)
+    (real p)
+    (let [parent (h/dirname p)]
+      (if (= parent p) p (h/join (real-or-parent parent) (h/basename p))))))
+
+(defn path-home-dirs
+  "Toolchain dirs on PATH under `home` (and their parent when named bin/, for
+  the libs beside it): what a :roots-scoped command still needs to read."
+  [home]
+  (vec (distinct (for [d (str/split (or (h/env "PATH") "") #":")
+                       :when (and (seq d) (under? d home))
+                       x (if (= "bin" (h/basename d)) [d (h/dirname d)] [d])]
+                   x))))
+
+(defn readable?
+  "Whether an in-process tool (read_file, search_files) may read `path`
+  under `pol`. Mirrors the sandbox: secret stores never; under :roots
+  scope nothing in the home directory outside `roots`."
+  [pol {:keys [path roots home]}]
+  (if (and (= :host (:confinement pol)) (not (:peer? pol)))
+    true
+    (let [p (real-or-parent path)
+          home (real home)
+          {:keys [dirs files name-patterns]} (secret-paths home)]
+      (not (or (some #(under? p (real %)) dirs)
+               (some #(= p (real %)) files)
+               (some #(re-find (re-pattern %) p) name-patterns)
+               (and (= :roots (:read-scope pol))
+                    (under? p home)
+                    (not (some #(under? p (real %)) roots))))))))
 
 (defn backend
   "Which kernel sandbox this host offers: :seatbelt | :bwrap | nil."
@@ -63,13 +108,12 @@
     (zero? (:exit (h/run-process ["/bin/sh" "-c" "command -v bwrap"] {}))) :bwrap
     :else nil))
 
-(defn- real [p] (try (h/realpath p) (catch :default _ p)))
-
 (defn- sb-str [s] (str "\"" (-> s (str/replace "\\" "\\\\") (str/replace "\"" "\\\"")) "\""))
 
 (defn seatbelt-profile
-  "SBPL text for {:write-roots [...] :home dir :network? bool}."
-  [{:keys [write-roots home network?]}]
+  "SBPL text for {:write-roots [...] :read-roots [...] :read-scope kw :home dir
+  :network? bool}. Later rules win, so the secret denials come last."
+  [{:keys [write-roots read-roots read-scope home network?]}]
   (let [{:keys [dirs files name-patterns]} (secret-paths home)]
     (str/join "\n"
               (concat
@@ -81,6 +125,13 @@
                                             "(regex #\"^/dev/tty\")" "(regex #\"^/dev/fd/\")"
                                             "(literal \"/dev/dtracehelper\")"]))
                      ")")]
+               ;; file-read-data, not file-read*: metadata stays readable so
+               ;; getcwd/cd through the home directory still resolve
+               (when (= :roots read-scope)
+                 [(str "(deny file-read-data (subpath " (sb-str (real home)) "))")
+                  (str "(allow file-read-data "
+                       (str/join " " (for [r (concat write-roots read-roots)] (str "(subpath " (sb-str (real r)) ")")))
+                       ")")])
                (for [d dirs] (str "(deny file-read* file-write* (subpath " (sb-str (real d)) "))"))
                (for [f files] (str "(deny file-read* file-write* (literal " (sb-str (real f)) "))"))
                ;; #"..." is a regex literal: backslashes pass through as written
@@ -89,44 +140,56 @@
                (when-not network? ["(deny network*)"])))))
 
 (defn bwrap-args
-  "bubblewrap argv prefix for the same policy."
-  [{:keys [write-roots home network?]}]
-  (let [{:keys [dirs files]} (secret-paths home)]
+  "bubblewrap argv prefix for the same policy. Mount order matters: an empty
+  home first (:roots scope), then the roots on top of it, then the secret
+  masks. Not exercised on this repo's CI host (macOS)."
+  [{:keys [write-roots read-roots read-scope home network?]}]
+  (let [{:keys [dirs files]} (secret-paths home)
+        roots? (= :roots read-scope)
+        visible? (fn [p] (or (not roots?) (some #(under? p %) (concat write-roots read-roots))))]
     (vec (concat ["bwrap" "--ro-bind" "/" "/" "--dev" "/dev" "--proc" "/proc"
                   "--die-with-parent" "--new-session"]
                  (when-not network? ["--unshare-net"])
+                 (when roots? ["--tmpfs" home])
+                 (when roots? (mapcat (fn [r] ["--ro-bind" r r]) (filter h/dir? read-roots)))
                  (mapcat (fn [r] ["--bind" r r]) write-roots)
-                 (mapcat (fn [d] ["--tmpfs" d]) (filter h/dir? dirs))
-                 (mapcat (fn [f] ["--ro-bind" "/dev/null" f]) (filter h/file? files))))))
+                 (mapcat (fn [d] ["--tmpfs" d]) (filter #(and (h/dir? %) (visible? %)) dirs))
+                 (mapcat (fn [f] ["--ro-bind" "/dev/null" f]) (filter #(and (h/file? %) (visible? %)) files))))))
 
 (defn env
   "The environment a confined command sees: base keys from this process,
-  plus the granted profile secrets by name, plus its own TMPDIR."
-  [{:keys [env-allow]} tool-env tmpdir]
+  plus the granted profile secrets by name, plus its own TMPDIR (and, under
+  :roots scope, TMPDIR as HOME: the host's dotfiles are not its to read)."
+  [{:keys [env-allow read-scope]} tool-env tmpdir]
   (merge (select-keys (h/process-env) base-env-keys)
          (select-keys tool-env env-allow)
-         {"TMPDIR" tmpdir}))
+         {"TMPDIR" tmpdir}
+         (when (= :roots read-scope) {"HOME" tmpdir})))
 
 (defn command
-  "How to run `cmd` under `pol`. Returns {:argv [...] :env {...} :tmpdir dir
-  :sandbox kw} or {:refused reason}."
-  [pol {:keys [cmd write-roots tool-env home backend]}]
+  "How to run `cmd` (a shell line) or `argv` under `pol`. Returns {:argv [...]
+  :env {...} :tmpdir dir :sandbox kw} or {:refused reason}. `read-roots` are
+  extra dirs readable under :roots scope (the write roots always are)."
+  [pol {:keys [cmd argv write-roots read-roots tool-env home backend]}]
+  (let [run (or argv ["/bin/sh" "-c" cmd])]
   (if (and (= :host (:confinement pol)) (not (:peer? pol)))
-    {:argv ["/bin/sh" "-c" cmd] :env (merge (h/process-env) tool-env) :sandbox :host}
+    {:argv run :env (merge (h/process-env) tool-env) :sandbox :host}
     (let [tmpdir (h/mkdirs (h/join (h/tmp-dir) (str "itonami-term-" (h/random-hex 6))))
           spec {:write-roots (vec (distinct (concat write-roots (:write-extra pol) [tmpdir])))
+                :read-roots (vec (distinct (concat read-roots (path-home-dirs home))))
+                :read-scope (:read-scope pol)
                 :home home :network? (:network? pol)}
           env' (env pol tool-env tmpdir)]
       (case backend
-        :seatbelt {:argv ["/usr/bin/sandbox-exec" "-p" (seatbelt-profile spec) "/bin/sh" "-c" cmd]
+        :seatbelt {:argv (into ["/usr/bin/sandbox-exec" "-p" (seatbelt-profile spec)] run)
                    :env env' :tmpdir tmpdir :sandbox :seatbelt}
-        :bwrap {:argv (into (bwrap-args spec) ["/bin/sh" "-c" cmd])
+        :bwrap {:argv (into (bwrap-args spec) run)
                 :env env' :tmpdir tmpdir :sandbox :bwrap}
         (do (h/rm tmpdir)
             {:refused (str "no OS sandbox on this host (need sandbox-exec or bwrap); "
                            (if (:peer? pol)
                              "turns run for a peer are never unconfined"
-                             "set :terminal {:confinement :host} in itonami.edn to run unconfined"))})))))
+                             "set :terminal {:confinement :host} in itonami.edn to run unconfined"))}))))))
 
 ;; ---------------------------------------------------------------- audit (pilot)
 

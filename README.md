@@ -84,8 +84,9 @@ requester (node A)                               peer (node B)
 - **`terminal` runs in an OS sandbox** (`itonami.agent.confine`): macOS
   Seatbelt (`sandbox-exec`) or Linux `bwrap`. Writes reach only the run's
   roots and a per-run `TMPDIR`; ssh/cloud/gpg keys, keychains, the node key
-  and every `.env` / `peer.env` are unreadable; there is no network; the env
-  is `PATH`/`HOME`/locale/`TERM` only. With no sandbox on the host the command
+  and every `.env` / `peer.env` are unreadable (also to `read_file` and
+  `search_files`); there is no network; the env is `PATH`/`HOME`/locale/`TERM`
+  only. With no sandbox on the host the command
   is refused. A turn run for a peer always gets this policy: the bundle's
   `itonami.edn` cannot widen it. The remaining conditions of ADR-2609242300
   (tunnel, cross-node resume) are still open.
@@ -102,8 +103,15 @@ Local runs read `:terminal` from the profile's `itonami.edn`:
 ```
 
 A profile without `:terminal` gets the default: sandboxed, offline, no
-secrets, writes confined to its terminal cwd. `read_file` and
-`search_files` are not confined by this policy.
+secrets, writes confined to its terminal cwd.
+
+`read_file` and `search_files` follow the same read rules: the secret stores
+are refused before the file is even looked up (a symlink is judged by its
+target), and `search_files` runs `rg` / `grep` / `find` inside the sandbox,
+so a search over a broad path skips them. A turn run for a peer reads
+nothing under the home directory except its own roots, the bundle it runs
+from and the toolchains on `PATH`; its commands get the per-run `TMPDIR` as
+`HOME`.
 
 ### Decentralised inference (no third-party relay)
 
