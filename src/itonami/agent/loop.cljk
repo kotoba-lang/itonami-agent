@@ -84,7 +84,7 @@ Use tools to act; do not describe a tool call instead of making it. Independent 
         writes (atom [])
         cwd (or cwd (some-> (get-in config ["terminal" "cwd"]) h/expand) (h/join (:home prof) "workspace"))
         _ (h/mkdirs cwd)
-        ctx {:cwd cwd :home (:home prof) :roots roots :writes writes :tool-env env
+        ctx {:cwd cwd :home (:home prof) :profile (:name prof) :roots roots :writes writes :tool-env env
              :terminal-policy (confine/policy (:itonami prof) {:peer? peer?})}
         t0 (h/now-ms)
         emit (or on-event (fn [_]))

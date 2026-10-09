@@ -226,6 +226,13 @@ plain: true
                 "granted with :terminal {:network true}")
             (finally (.kill srv)))))
 
+      (testing "every confined command leaves an audit line; denials are flagged"
+        (let [lines (str/split-lines (h/slurp (h/join (p2p/itonami-dir) "logs" "terminal-sandbox.jsonl")))
+              recs (map h/json-parse lines)]
+          (is (every? #(= "seatbelt" (get % "sandbox")) recs))
+          (is (some #(and (get % "suspected_denial") (str/includes? (get % "cmd") "ENCRYPTED")) recs))
+          (is (not (get (first (filter #(str/includes? (get % "cmd") "echo built") recs)) "suspected_denial")))))
+
       (testing "the per-run TMPDIR is writable and removed afterwards"
         (let [out (get (term ctx "echo t > \"$TMPDIR/t\" && cat \"$TMPDIR/t\" && echo \"$TMPDIR\"") "output")
               tmp (str/trim (last (str/split-lines out)))]

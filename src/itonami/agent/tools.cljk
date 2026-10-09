@@ -124,6 +124,9 @@
           (let [r (try (h/run-process (:argv c) {:cwd cwd :exact-env? true :env (:env c)
                                                  :timeout-ms (* 1000 (or timeout (:terminal-timeout-s ctx) 180))})
                        (finally (when (:tmpdir c) (h/rm (:tmpdir c)))))]
+            (confine/audit! {:profile (:profile ctx) :peer? (:peer? pol) :sandbox (:sandbox c)
+                             :cmd (str command) :exit (:exit r) :stderr (:stderr r)
+                             :timed-out? (:timed-out? r)})
             (ok {"output" (clip (str (:stdout r) (when-not (str/blank? (:stderr r)) (str "\n[stderr]\n" (:stderr r)))) 50000)
                  "exit_code" (:exit r)
                  "sandbox" (name (:sandbox c))
