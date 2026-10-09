@@ -145,22 +145,44 @@
                (for [p name-patterns] (str "(deny file-read* file-write* (regex #\"" (str/replace p "\"" "\\\"") "\"))"))
                (when-not network? ["(deny network*)"])))))
 
+(def ^:private secret-file-find
+  ;; find(1) form of :name-patterns (bwrap cannot match by pattern)
+  ["(" "-name" "node_modules" "-o" "-name" ".git" ")" "-prune" "-o" "-type" "f"
+   "(" "-name" "*.env" "-o" "-name" "*.env.*" "-o" "-name" "secrets.command" "-o" "-name" "auth.json" ")" "-print"])
+
+(defn secret-files-under
+  "Every file matching :name-patterns under `dirs`, for bwrap to mask one by
+  one. nil when the scan does not finish in time (the caller refuses)."
+  [dirs]
+  (let [dirs (filter h/dir? dirs)]
+    (if (empty? dirs)
+      []
+      (let [r (h/run-process (into (into ["find"] dirs) secret-file-find) {:timeout-ms 15000})]
+        (when-not (:timed-out? r)
+          (vec (distinct (remove str/blank? (str/split-lines (:stdout r))))))))))
+
 (defn bwrap-args
-  "bubblewrap argv prefix for the same policy. Mount order matters: an empty
-  home first (:roots scope), then the roots on top of it, then the secret
-  masks. Not exercised on this repo's CI host (macOS)."
-  [{:keys [write-roots read-roots read-scope home network?]}]
+  "bubblewrap argv prefix for the same policy, or nil when the secret-file
+  scan did not finish. bwrap matches paths, not patterns, so it hides the
+  whole home directory (both read scopes -- narrower than Seatbelt's
+  :all-but-secrets) and shows back only the roots, the read roots and the
+  PATH toolchains, then masks each dotenv / secrets file found under them.
+  Mount order matters: empty home, roots on top, masks last."
+  [{:keys [write-roots read-roots home network?]}]
   (let [{:keys [dirs files]} (secret-paths home)
-        roots? (= :roots read-scope)
-        visible? (fn [p] (or (not roots?) (some #(under? p %) (concat write-roots read-roots))))]
-    (vec (concat ["bwrap" "--ro-bind" "/" "/" "--dev" "/dev" "--proc" "/proc"
-                  "--die-with-parent" "--new-session"]
-                 (when-not network? ["--unshare-net"])
-                 (when roots? ["--tmpfs" home])
-                 (when roots? (mapcat (fn [r] ["--ro-bind" r r]) (filter h/dir? read-roots)))
-                 (mapcat (fn [r] ["--bind" r r]) write-roots)
-                 (mapcat (fn [d] ["--tmpfs" d]) (filter #(and (h/dir? %) (visible? %)) dirs))
-                 (mapcat (fn [f] ["--ro-bind" "/dev/null" f]) (filter #(and (h/file? %) (visible? %)) files))))))
+        shown (vec (distinct (concat write-roots read-roots)))
+        visible? (fn [p] (some #(under? p %) shown))
+        found (secret-files-under shown)]
+    (when found
+      (vec (concat ["bwrap" "--ro-bind" "/" "/" "--dev" "/dev" "--proc" "/proc"
+                    "--die-with-parent" "--new-session"]
+                   (when-not network? ["--unshare-net"])
+                   ["--tmpfs" home]
+                   (mapcat (fn [r] ["--ro-bind" r r]) (filter #(and (h/dir? %) (under? % home)) read-roots))
+                   (mapcat (fn [r] ["--bind" r r]) write-roots)
+                   (mapcat (fn [d] ["--tmpfs" d]) (filter #(and (h/dir? %) (visible? %)) dirs))
+                   (mapcat (fn [f] ["--ro-bind" "/dev/null" f])
+                           (distinct (concat (filter #(and (h/file? %) (visible? %)) files) found))))))))
 
 (defn env
   "The environment a confined command sees: base keys from this process,
@@ -189,8 +211,10 @@
       (case backend
         :seatbelt {:argv (into ["/usr/bin/sandbox-exec" "-p" (seatbelt-profile spec)] run)
                    :env env' :tmpdir tmpdir :sandbox :seatbelt}
-        :bwrap {:argv (into (bwrap-args spec) run)
-                :env env' :tmpdir tmpdir :sandbox :bwrap}
+        :bwrap (if-let [pre (bwrap-args spec)]
+                 {:argv (into pre run) :env env' :tmpdir tmpdir :sandbox :bwrap}
+                 (do (h/rm tmpdir)
+                     {:refused "secret-file scan under the run's directories did not finish in 15 s"}))
         (do (h/rm tmpdir)
             {:refused (str "no OS sandbox on this host (need sandbox-exec or bwrap); "
                            (if (:peer? pol)
@@ -200,9 +224,10 @@
 ;; ---------------------------------------------------------------- audit (pilot)
 
 (def denial-signs
-  "stderr shapes a sandbox denial leaves: file ops (EPERM), DNS and connect
+  "stderr shapes a sandbox denial leaves: file ops (EPERM on Seatbelt, EROFS
+  under bwrap's read-only binds), DNS and connect
   under (deny network*). A hint for the operator, not a verdict."
-  #"Operation not permitted|Could not resolve host|Couldn't connect|Network is unreachable|nodename nor servname|getaddrinfo")
+  #"Operation not permitted|Read-only file system|Could not resolve host|Couldn't connect|Network is unreachable|nodename nor servname|getaddrinfo")
 
 (defn- audit-line! [m]
   (try

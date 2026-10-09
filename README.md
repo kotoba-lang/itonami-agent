@@ -91,6 +91,19 @@ requester (node A)                               peer (node B)
   `itonami.edn` cannot widen it. The remaining conditions of ADR-2609242300
   (tunnel, cross-node resume) are still open.
 
+### Linux (bwrap) differs from macOS (Seatbelt)
+
+bwrap matches paths, not patterns. Under it the whole home directory is an
+empty tmpfs for every run, local ones too, and only the run's roots, the
+profile home and the PATH toolchains are shown back; each `*.env`,
+`*.env.*`, `secrets.command` and `auth.json` found under them (node_modules
+and .git pruned) is masked with /dev/null. If that scan takes over 15 s the
+command is refused. So a local run on Linux sees less of the home directory
+than on macOS, and a dotenv outside the home directory (e.g. /srv/app/.env)
+is not masked there. Verified on Linux 6.15 / bubblewrap 0.8.0 in a
+container (2026-10-09): the same 193 assertions pass, and with the sandbox
+bypassed 18 attack assertions fail.
+
 ## Terminal policy
 
 Local runs read `:terminal` from the profile's `itonami.edn`:

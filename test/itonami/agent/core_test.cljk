@@ -165,7 +165,7 @@ plain: true
       (is (str/includes? (get r "error") "never unconfined"))
       (h/rm dir))))
 
-(when (= :seatbelt (confine/backend))
+(when (#{:seatbelt :bwrap} (confine/backend))
   (deftest terminal-red-team
     (let [base (h/mkdirs (h/join (p2p/itonami-dir) "test-redteam"))
           ws (h/mkdirs (h/join base "ws"))
@@ -184,7 +184,7 @@ plain: true
 
       (testing "C0 control: ordinary work inside the run's root still works"
         (let [r (term ctx "echo built > out.txt && cat out.txt")]
-          (is (= "seatbelt" (get r "sandbox")))
+          (is (= (name (confine/backend)) (get r "sandbox")))
           (is (= 0 (get r "exit_code")))
           (is (str/includes? (get r "output") "built"))))
 
@@ -235,7 +235,7 @@ plain: true
       (testing "every confined command leaves an audit line; denials are flagged"
         (let [lines (str/split-lines (h/slurp (h/join (p2p/itonami-dir) "logs" "terminal-sandbox.jsonl")))
               recs (map h/json-parse lines)]
-          (is (every? #(= "seatbelt" (get % "sandbox")) (filter #(= "terminal" (get % "tool")) recs)))
+          (is (every? #(= (name (confine/backend)) (get % "sandbox")) (filter #(= "terminal" (get % "tool")) recs)))
           (is (some #(and (get % "suspected_denial") (str/includes? (get % "cmd") "ENCRYPTED")) recs))
           (is (not (get (first (filter #(str/includes? (get % "cmd") "echo built") recs)) "suspected_denial")))))
 
@@ -248,7 +248,7 @@ plain: true
 
 ;; ---------------------------------------------------------------- read_file / search_files confinement
 
-(when (= :seatbelt (confine/backend))
+(when (#{:seatbelt :bwrap} (confine/backend))
   (deftest read-tools-red-team
     (let [base (h/realpath (h/mkdirs (h/join (p2p/itonami-dir) "test-readtools")))
           ws (h/mkdirs (h/join base "ws"))
