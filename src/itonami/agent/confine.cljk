@@ -83,22 +83,25 @@
                        x (if (= "bin" (h/basename d)) [d (h/dirname d)] [d])]
                    x))))
 
-(defn readable?
-  "Whether an in-process tool (read_file, search_files) may read `path`
-  under `pol`. Mirrors the sandbox: secret stores never; under :roots
-  scope nothing in the home directory outside `roots`."
+(defn read-denial
+  "Why an in-process tool (read_file, search_files) may not read `path` under
+  `pol`: :secret | :outside-roots, or nil when it may. Mirrors the sandbox:
+  secret stores never; under :roots scope nothing in the home directory
+  outside `roots`."
   [pol {:keys [path roots home]}]
-  (if (and (= :host (:confinement pol)) (not (:peer? pol)))
-    true
+  (when-not (and (= :host (:confinement pol)) (not (:peer? pol)))
     (let [p (real-or-parent path)
           home (real home)
           {:keys [dirs files name-patterns]} (secret-paths home)]
-      (not (or (some #(under? p (real %)) dirs)
-               (some #(= p (real %)) files)
-               (some #(re-find (re-pattern %) p) name-patterns)
-               (and (= :roots (:read-scope pol))
-                    (under? p home)
-                    (not (some #(under? p (real %)) roots))))))))
+      (cond
+        (or (some #(under? p (real %)) dirs)
+            (some #(= p (real %)) files)
+            (some #(re-find (re-pattern %) p) name-patterns)) :secret
+        (and (= :roots (:read-scope pol))
+             (under? p home)
+             (not (some #(under? p (real %)) roots))) :outside-roots))))
+
+(defn readable? [pol opts] (nil? (read-denial pol opts)))
 
 (defn backend
   "Which kernel sandbox this host offers: :seatbelt | :bwrap | nil."
@@ -198,16 +201,28 @@
   under (deny network*). A hint for the operator, not a verdict."
   #"Operation not permitted|Could not resolve host|Couldn't connect|Network is unreachable|nodename nor servname|getaddrinfo")
 
+(defn- audit-line! [m]
+  (try
+    (h/spit (h/join (itonami-dir) "logs" "terminal-sandbox.jsonl")
+            (str (h/json-str (merge {"ts" (h/iso-local)} m)) "\n")
+            {:append? true})
+    (catch :default _ nil)))
+
+(defn- clip200 [s] (let [s (str s)] (subs s 0 (min 200 (count s)))))
+
 (defn audit!
   "One line per confined command in <itonami-dir>/logs/terminal-sandbox.jsonl,
   so a rollout can see which turns the policy got in the way of."
   [{:keys [profile peer? sandbox cmd exit stderr timed-out?]}]
-  (try
-    (h/spit (h/join (itonami-dir) "logs" "terminal-sandbox.jsonl")
-            (str (h/json-str {"ts" (h/iso-local) "profile" profile "peer" (boolean peer?)
-                              "sandbox" (name sandbox) "exit" exit "timed_out" (boolean timed-out?)
-                              "suspected_denial" (boolean (and stderr (re-find denial-signs stderr)))
-                              "cmd" (subs cmd 0 (min 200 (count cmd)))})
-                 "\n")
-            {:append? true})
-    (catch :default _ nil)))
+  (audit-line! {"tool" "terminal" "profile" profile "peer" (boolean peer?)
+                "sandbox" (name sandbox) "exit" exit "timed_out" (boolean timed-out?)
+                "suspected_denial" (boolean (and stderr (re-find denial-signs stderr)))
+                "cmd" (clip200 cmd)}))
+
+(defn audit-denied!
+  "One line per path read_file / search_files refused, in the same log.
+  `reason`: :secret (a secret store) | :outside-roots (home outside a peer
+  turn's roots)."
+  [{:keys [tool profile peer? path reason]}]
+  (audit-line! {"tool" tool "profile" profile "peer" (boolean peer?)
+                "denied" true "reason" (name reason) "path" (clip200 path)}))

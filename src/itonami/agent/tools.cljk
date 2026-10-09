@@ -108,8 +108,14 @@
   [ctx]
   (vec (distinct (remove nil? (concat (or (:roots ctx) [(:cwd ctx)]) [(:home ctx)])))))
 
-(defn- readable? [ctx abs]
-  (confine/readable? (policy ctx) {:path abs :roots (read-roots ctx) :home (host-home ctx)}))
+(defn- readable?
+  "Whether `tool` may read `abs`; a refusal is written to the sandbox audit log."
+  [ctx tool abs]
+  (let [pol (policy ctx)
+        why (confine/read-denial pol {:path abs :roots (read-roots ctx) :home (host-home ctx)})]
+    (when why
+      (confine/audit-denied! {:tool tool :profile (:profile ctx) :peer? (:peer? pol) :path abs :reason why}))
+    (nil? why)))
 
 (defn- record-write! [ctx abs]
   (when-let [w (:writes ctx)] (swap! w conj abs)))
@@ -150,7 +156,7 @@
   (let [abs (resolve-path ctx path)]
     (cond
       ;; checked before existence, so a denied path does not leak whether it exists
-      (not (readable? ctx abs)) (err (str "path not readable under this run's policy: " abs))
+      (not (readable? ctx "read_file" abs)) (err (str "path not readable under this run's policy: " abs))
       (not (h/file? abs)) (err (str "file not found: " abs))
       :else
       (let [ls (str/split-lines (h/slurp abs))
@@ -192,7 +198,7 @@
   [ctx {:strs [pattern target path file_glob limit]}]
   (let [dir (resolve-path ctx (or path "."))
         lim (or limit 50)]
-    (if-not (readable? ctx dir)
+    (if-not (readable? ctx "search_files" dir)
       (err (str "path not readable under this run's policy: " dir))
       (let [rg? (zero? (:exit (h/run-process ["which" "rg"] {})))
             argv (if (= target "files")

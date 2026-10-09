@@ -233,7 +233,7 @@ plain: true
       (testing "every confined command leaves an audit line; denials are flagged"
         (let [lines (str/split-lines (h/slurp (h/join (p2p/itonami-dir) "logs" "terminal-sandbox.jsonl")))
               recs (map h/json-parse lines)]
-          (is (every? #(= "seatbelt" (get % "sandbox")) recs))
+          (is (every? #(= "seatbelt" (get % "sandbox")) (filter #(= "terminal" (get % "tool")) recs)))
           (is (some #(and (get % "suspected_denial") (str/includes? (get % "cmd") "ENCRYPTED")) recs))
           (is (not (get (first (filter #(str/includes? (get % "cmd") "echo built") recs)) "suspected_denial")))))
 
@@ -301,6 +301,18 @@ plain: true
         (let [out (str/join "\n" (get (sr peer ws) "matches"))]
           (is (str/includes? out "DECOY-visible"))
           (is (not (str/includes? out "DECOY-env")))))
+
+      (testing "every refused read is in the audit log, with tool and reason"
+        (let [recs (map h/json-parse (str/split-lines (h/slurp (h/join (p2p/itonami-dir) "logs" "terminal-sandbox.jsonl"))))
+              denied (filter #(get % "denied") recs)
+              has? (fn [tool reason frag] (some #(and (= tool (get % "tool")) (= reason (get % "reason"))
+                                                      (str/includes? (get % "path") frag)) denied))]
+          (is (has? "read_file" "secret" "id_ed25519"))
+          (is (has? "read_file" "secret" ".env"))
+          (is (has? "read_file" "outside-roots" "plan.txt"))
+          (is (has? "search_files" "outside-roots" "test-readtools"))
+          (is (every? #(true? (get % "peer")) (filter #(= "outside-roots" (get % "reason")) denied)))
+          (is (not-any? #(str/includes? (str (get % "path")) "notes.txt") denied) "allowed reads are not logged")))
 
       (testing "terminal on a peer turn: home outside the roots is unreadable, HOME is the run's TMPDIR"
         (let [out (get (h/json-parse (tools/terminal peer {"command" (str "cat " private "; echo HOME=$HOME")})) "output")]
