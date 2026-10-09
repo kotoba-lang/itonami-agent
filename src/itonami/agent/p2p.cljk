@@ -285,7 +285,8 @@
                                          :toolsets (get opts "toolsets")
                                          :model (get opts "model") :provider (get opts "provider")
                                          :pinned? (get opts "pinned")
-                                         :cwd ws :roots [ws (h/join home "workspace")]})
+                                         :cwd ws :roots [ws (h/join home "workspace")]
+                                         :peer? true})
           writes (into (sorted-map)
                        (for [abs (distinct (:writes r))
                              :when (and (str/starts-with? abs (str ws "/")) (h/file? abs))]

@@ -81,9 +81,29 @@ requester (node A)                               peer (node B)
 - **Secrets never cross**. The executing peer pays inference with its own
   rail (`~/.itonami/peer.env` or its environment); `murakumo` is put on the
   chain when the profile's `:inference-rail` is `:murakumo`.
-- **Not a sandbox.** `terminal` on a peer is a real shell on that peer. Trust
-  is the boundary. The four conditions of ADR-2609242300 (gVisor/rootless
-  isolation, tunnel, cross-node resume, secret isolation) are still open.
+- **`terminal` runs in an OS sandbox** (`itonami.agent.confine`): macOS
+  Seatbelt (`sandbox-exec`) or Linux `bwrap`. Writes reach only the run's
+  roots and a per-run `TMPDIR`; ssh/cloud/gpg keys, keychains, the node key
+  and every `.env` / `peer.env` are unreadable; there is no network; the env
+  is `PATH`/`HOME`/locale/`TERM` only. With no sandbox on the host the command
+  is refused. A turn run for a peer always gets this policy: the bundle's
+  `itonami.edn` cannot widen it. The remaining conditions of ADR-2609242300
+  (tunnel, cross-node resume) are still open.
+
+## Terminal policy
+
+Local runs read `:terminal` from the profile's `itonami.edn`:
+
+```clojure
+:terminal {:confinement :sandbox     ; default; :host = run unconfined (local only)
+           :network true             ; outbound network (default: none)
+           :env ["GITHUB_TOKEN"]     ; profile secrets passed to commands, by name
+           :write ["~/notes"]}       ; extra write roots
+```
+
+A profile without `:terminal` gets the default: sandboxed, offline, no
+secrets, writes confined to its terminal cwd. `read_file` and
+`search_files` are not confined by this policy.
 
 ### Decentralised inference (no third-party relay)
 

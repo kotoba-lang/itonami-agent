@@ -19,6 +19,8 @@
   (let [e (.-env js/process)]
     (into {} (for [k (js/Object.keys e)] [k (aget e k)]))))
 (defn home-dir [] (os/homedir))
+(defn tmp-dir [] (os/tmpdir))
+(defn realpath [p] (fs/realpathSync p))
 (defn expand [p] (if (and p (str/starts-with? p "~")) (str (home-dir) (subs p 1)) p))
 (defn join [& parts] (apply path/join (map str parts)))
 (defn dirname [p] (path/dirname p))
@@ -144,13 +146,14 @@
 ;; ---------------------------------------------------------------- processes
 
 (defn run-process
-  "Run argv (no shell) or, with :shell, a shell command line. Returns
+  "Run argv (no shell) or, with :shell, a shell command line. :env is merged
+  over this process's env unless :exact-env? (then it is the whole env). Returns
   {:exit :stdout :stderr :timed-out?}. Never throws on a non-zero exit."
-  [cmd {:keys [cwd timeout-ms env shell input]}]
+  [cmd {:keys [cwd timeout-ms env exact-env? shell input]}]
   (let [opts (clj->js (cond-> {:encoding "utf8"
                                :maxBuffer (* 64 1024 1024)
                                :timeout (or timeout-ms 180000)
-                               :env (merge (process-env) env)}
+                               :env (if exact-env? env (merge (process-env) env))}
                         cwd (assoc :cwd cwd)
                         input (assoc :input input)))
         r (if shell

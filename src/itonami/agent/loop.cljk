@@ -12,7 +12,8 @@
             [promesa.core :as p]
             [itonami.agent.host :as h]
             [itonami.agent.provider :as provider]
-            [itonami.agent.tools :as tools]))
+            [itonami.agent.tools :as tools]
+            [itonami.agent.confine :as confine]))
 
 (def wrapup-notice
   "\n\n[RUN BUDGET] You have used most of this run's time budget. Stop starting new work: finish the current step and give your final answer now.")
@@ -73,7 +74,7 @@ Use tools to act; do not describe a tool call instead of making it. Independent 
    {:final str :exit-reason str :turns n :messages [...] :usage {...}
     :provider str :model str :attempts [...] :writes [abs-paths]}"
   [{:keys [config env] :as prof} prompt {:keys [model provider pinned? toolsets cwd roots platform
-                                                load-context? max-turns budget-s on-event]}]
+                                                load-context? max-turns budget-s on-event peer?]}]
   (let [max-turns (or max-turns (get-in config ["agent" "max_turns"]) (get config "max_turns") 90)
         budget-ms (* 1000 (or budget-s (get-in config ["agent" "run_budget_seconds"]) 0))
         hops (provider/decentralize (provider/chain config {:model model :provider provider :pinned? pinned?})
@@ -83,7 +84,8 @@ Use tools to act; do not describe a tool call instead of making it. Independent 
         writes (atom [])
         cwd (or cwd (some-> (get-in config ["terminal" "cwd"]) h/expand) (h/join (:home prof) "workspace"))
         _ (h/mkdirs cwd)
-        ctx {:cwd cwd :home (:home prof) :roots roots :writes writes :tool-env env}
+        ctx {:cwd cwd :home (:home prof) :roots roots :writes writes :tool-env env
+             :terminal-policy (confine/policy (:itonami prof) {:peer? peer?})}
         t0 (h/now-ms)
         emit (or on-event (fn [_]))
         usage (atom {"prompt_tokens" 0 "completion_tokens" 0 "total_tokens" 0})

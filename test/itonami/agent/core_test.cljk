@@ -7,7 +7,9 @@
             [itonami.agent.provider :as provider]
             [itonami.agent.cron :as cron]
             [itonami.agent.p2p :as p2p]
-            [itonami.agent.tools :as tools]))
+            [itonami.agent.tools :as tools]
+            [itonami.agent.confine :as confine]
+            ["node:child_process" :as cp]))
 
 (deftest yaml-hermes-subset
   (let [y (yaml/parse "
@@ -126,3 +128,107 @@ plain: true
     (is (contains? (h/json-parse (tools/write-file ctx {"path" "a.txt" "content" "x"})) "bytes_written"))
     (is (str/includes? (get (h/json-parse (tools/write-file ctx {"path" "/tmp/itonami-escape.txt" "content" "x"})) "error") "outside"))
     (h/rm dir)))
+
+;; ---------------------------------------------------------------- terminal confinement
+;; The red-team cases A1-A6 of the kotoba CSF assessment, run against the
+;; `terminal` tool itself: each attack must leave its target untouched.
+
+(defn- term [ctx cmd] (h/json-parse (tools/terminal ctx {"command" cmd})))
+
+(deftest terminal-policy-shape
+  (testing "a bundle cannot unconfine a turn run for a peer"
+    (let [evil {:terminal {:confinement :host :network true :env ["NODE_KEY"] :write ["/"]}}
+          pol (confine/policy evil {:peer? true})]
+      (is (= :sandbox (:confinement pol)))
+      (is (false? (:network? pol)))
+      (is (empty? (:env-allow pol)))
+      (is (empty? (:write-extra pol)))))
+  (testing "local default is confined, offline, no secrets"
+    (is (= {:confinement :sandbox :network? false :env-allow [] :write-extra [] :peer? false}
+           (confine/policy nil {}))))
+  (testing "no sandbox on the host: refuse, never fall back to a bare shell"
+    (let [dir (h/mkdirs (h/join (p2p/itonami-dir) "test-nobackend"))
+          r (term {:cwd dir :home dir :sandbox-backend nil
+                   :terminal-policy (confine/policy nil {})} "echo should-not-run")]
+      (is (str/starts-with? (get r "error") "terminal refused"))
+      (is (nil? (get r "output")))
+      (h/rm dir)))
+  (testing "a peer turn on a host without a sandbox is refused even if the bundle asks for :host"
+    (let [dir (h/mkdirs (h/join (p2p/itonami-dir) "test-nobackend-peer"))
+          r (term {:cwd dir :home dir :sandbox-backend nil
+                   :terminal-policy (confine/policy {:terminal {:confinement :host}} {:peer? true})} "echo x")]
+      (is (str/includes? (get r "error") "never unconfined"))
+      (h/rm dir))))
+
+(when (= :seatbelt (confine/backend))
+  (deftest terminal-red-team
+    (let [base (h/mkdirs (h/join (p2p/itonami-dir) "test-redteam"))
+          ws (h/mkdirs (h/join base "ws"))
+          victim (h/join base "victim" "victim.txt")
+          fake-home (h/mkdirs (h/join base "home"))
+          ssh-key (h/join fake-home ".ssh" "id_ed25519")
+          dotenv (h/join ws "app" ".env")
+          ctx {:cwd ws :home ws :roots [ws] :writes (atom []) :host-home fake-home
+               :tool-env {"OPENROUTER_API_KEY" "sk-decoy" "GITHUB_TOKEN" "ghp-decoy"}
+               :terminal-policy (confine/policy nil {})}
+          intact? #(= "IMPORTANT BUSINESS DATA v1\n" (h/slurp victim))]
+      (h/spit victim "IMPORTANT BUSINESS DATA v1\n")
+      (h/spit ssh-key "DECOY-PRIVATE-KEY\n")
+      (h/spit dotenv "DB_PASSWORD=decoy\n")
+      (.symlinkSync (js/require "node:fs") victim (h/join ws "link.txt"))
+
+      (testing "C0 control: ordinary work inside the run's root still works"
+        (let [r (term ctx "echo built > out.txt && cat out.txt")]
+          (is (= "seatbelt" (get r "sandbox")))
+          (is (= 0 (get r "exit_code")))
+          (is (str/includes? (get r "output") "built"))))
+
+      (testing "A1 ransomware: overwrite a file outside the roots"
+        (term ctx (str "echo ENCRYPTED > " victim))
+        (is (intact?)))
+      (testing "A2 traversal out of the root"
+        (term ctx "echo ENCRYPTED > ../victim/victim.txt")
+        (is (intact?)))
+      (testing "A3 symlink inside the root pointing out"
+        (term ctx "echo ENCRYPTED > link.txt")
+        (is (intact?)))
+      (testing "A1' delete instead of encrypt"
+        (term ctx (str "rm -rf " (h/dirname victim)))
+        (is (intact?)))
+
+      (testing "A4 exfiltration: read an ssh key and a dotenv"
+        (is (not (str/includes? (get (term ctx (str "cat " ssh-key)) "output") "DECOY-PRIVATE-KEY")))
+        (is (not (str/includes? (get (term ctx "cat app/.env") "output") "decoy")))
+        (is (not (str/includes? (get (term ctx (str "cp " ssh-key " stolen && cat stolen")) "output") "DECOY"))))
+
+      (testing "A5 credential theft through the environment"
+        (let [out (get (term ctx "env") "output")]
+          (is (not (str/includes? out "sk-decoy")))
+          (is (not (str/includes? out "ghp-decoy"))))
+        (testing "a secret named in :terminal :env is passed, and only that one"
+          (let [out (get (term (assoc ctx :terminal-policy (confine/policy {:terminal {:env ["GITHUB_TOKEN"]}} {})) "env") "output")]
+            (is (str/includes? out "ghp-decoy"))
+            (is (not (str/includes? out "sk-decoy"))))))
+
+      (testing "A6 lateral movement: a spawned shell inherits the same box"
+        (term ctx (str "/bin/sh -c 'touch " (h/join base "victim" "PWNED") "'"))
+        (is (not (h/exists? (h/join base "victim" "PWNED")))))
+
+      (testing "A10 C2 / exfil over the network, loopback included"
+        (let [port (+ 18000 (rand-int 1000))
+              srv (cp/spawn "node" #js ["-e" (str "require('http').createServer((q,r)=>r.end('SERVED')).listen(" port ")")]
+                            #js {:stdio "ignore"})]
+          (h/run-process ["/bin/sh" "-c" (str "for i in 1 2 3 4 5 6 7 8 9 10; do curl -s -m 1 http://127.0.0.1:" port "/ && exit 0; sleep 0.3; done")] {})
+          (try
+            (is (not (str/includes? (str (get (term ctx (str "curl -sS -m 3 http://127.0.0.1:" port "/")) "output")) "SERVED")) "denied by default")
+            (is (str/includes? (str (get (term (assoc ctx :terminal-policy (confine/policy {:terminal {:network true}} {}))
+                                             (str "curl -sS -m 3 http://127.0.0.1:" port "/")) "output")) "SERVED")
+                "granted with :terminal {:network true}")
+            (finally (.kill srv)))))
+
+      (testing "the per-run TMPDIR is writable and removed afterwards"
+        (let [out (get (term ctx "echo t > \"$TMPDIR/t\" && cat \"$TMPDIR/t\" && echo \"$TMPDIR\"") "output")
+              tmp (str/trim (last (str/split-lines out)))]
+          (is (str/starts-with? out "t"))
+          (is (not (h/exists? tmp)))))
+      (h/rm base))))

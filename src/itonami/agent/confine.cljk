@@ -1,0 +1,127 @@
+(ns itonami.agent.confine
+  "The OS boundary around `terminal`. A shell command an LLM wrote runs
+  with what its policy grants and nothing else:
+
+    writes   only the run's write roots and a per-run TMPDIR
+    reads    everything except the host's secret stores (ssh/cloud/gpg keys,
+             keychains, the node key, every .env / peer.env / secrets file)
+    network  none unless granted
+    env      PATH/HOME/locale/TERM + the profile secrets named in :env
+
+  Enforced by the kernel, not by parsing the command: macOS Seatbelt
+  (`sandbox-exec`), Linux bubblewrap (`bwrap`). With neither present the
+  command is refused (fail closed) unless the profile opts out with
+  `:terminal {:confinement :host}` -- and a turn run for a peer can never
+  opt out, because the requester wrote the bundle's itonami.edn.
+
+  Policy, in itonami.edn:
+    :terminal {:confinement :sandbox     ; default; :host = run unconfined
+               :network false            ; true = outbound network allowed
+               :env [\"GITHUB_TOKEN\"]     ; profile secrets passed by name
+               :write [\"~/notes\"]}       ; extra write roots (local runs)"
+  (:require [clojure.string :as str]
+            [itonami.agent.host :as h]))
+
+(def base-env-keys
+  ["PATH" "HOME" "USER" "LOGNAME" "SHELL" "LANG" "LC_ALL" "LC_CTYPE" "TERM" "TZ"])
+
+(defn- itonami-dir [] (h/expand (or (h/env "ITONAMI_DIR") "~/.itonami")))
+
+(defn secret-paths
+  "Directories and files under `home` a confined command may not read."
+  [home]
+  (let [j #(h/join home %)]
+    {:dirs (cond-> [(j ".ssh") (j ".aws") (j ".gnupg") (j ".kube") (j ".docker")
+                    (j ".config/gh") (j ".config/gcloud") (j ".azure") (j ".password-store")
+                    (j "Library/Keychains") (h/join (itonami-dir) "node")]
+             true vec)
+     :files (vec (concat [(j ".netrc") (j ".git-credentials") (j ".npmrc") (j ".pypirc")
+                          (h/join (itonami-dir) "peer.env") (j ".hermes/.env")]
+                         ;; bwrap cannot match by pattern: name each profile's .env
+                         (for [p (h/ls (j ".hermes/profiles"))] (j (str ".hermes/profiles/" p "/.env")))))
+     ;; any dotenv or secrets file anywhere: profile homes, workspaces, repos
+     :name-patterns ["\\.env$" "\\.env\\.[^/]*$" "/secrets\\.command$" "/auth\\.json$"]}))
+
+(defn policy
+  "The terminal policy of a run. `peer?` = a turn this node runs for
+  someone else: the bundle's own :terminal is ignored."
+  [itonami-edn {:keys [peer?]}]
+  (let [t (when-not peer? (:terminal itonami-edn))]
+    {:confinement (if peer? :sandbox (get t :confinement :sandbox))
+     :network? (boolean (and (not peer?) (:network t)))
+     :env-allow (vec (when-not peer? (:env t)))
+     :write-extra (vec (when-not peer? (map h/expand (:write t))))
+     :peer? (boolean peer?)}))
+
+(defn backend
+  "Which kernel sandbox this host offers: :seatbelt | :bwrap | nil."
+  []
+  (cond
+    (and (= "darwin" (.-platform js/process)) (h/file? "/usr/bin/sandbox-exec")) :seatbelt
+    (zero? (:exit (h/run-process ["/bin/sh" "-c" "command -v bwrap"] {}))) :bwrap
+    :else nil))
+
+(defn- real [p] (try (h/realpath p) (catch :default _ p)))
+
+(defn- sb-str [s] (str "\"" (-> s (str/replace "\\" "\\\\") (str/replace "\"" "\\\"")) "\""))
+
+(defn seatbelt-profile
+  "SBPL text for {:write-roots [...] :home dir :network? bool}."
+  [{:keys [write-roots home network?]}]
+  (let [{:keys [dirs files name-patterns]} (secret-paths home)]
+    (str/join "\n"
+              (concat
+               ["(version 1)" "(allow default)"
+                "(deny file-write*)"
+                (str "(allow file-write* "
+                     (str/join " " (concat (for [r write-roots] (str "(subpath " (sb-str (real r)) ")"))
+                                           ["(literal \"/dev/null\")" "(literal \"/dev/zero\")"
+                                            "(regex #\"^/dev/tty\")" "(regex #\"^/dev/fd/\")"
+                                            "(literal \"/dev/dtracehelper\")"]))
+                     ")")]
+               (for [d dirs] (str "(deny file-read* file-write* (subpath " (sb-str (real d)) "))"))
+               (for [f files] (str "(deny file-read* file-write* (literal " (sb-str (real f)) "))"))
+               ;; #"..." is a regex literal: backslashes pass through as written
+               ;; (doubling them, as sb-str does, makes \\.env match nothing)
+               (for [p name-patterns] (str "(deny file-read* file-write* (regex #\"" (str/replace p "\"" "\\\"") "\"))"))
+               (when-not network? ["(deny network*)"])))))
+
+(defn bwrap-args
+  "bubblewrap argv prefix for the same policy."
+  [{:keys [write-roots home network?]}]
+  (let [{:keys [dirs files]} (secret-paths home)]
+    (vec (concat ["bwrap" "--ro-bind" "/" "/" "--dev" "/dev" "--proc" "/proc"
+                  "--die-with-parent" "--new-session"]
+                 (when-not network? ["--unshare-net"])
+                 (mapcat (fn [r] ["--bind" r r]) write-roots)
+                 (mapcat (fn [d] ["--tmpfs" d]) (filter h/dir? dirs))
+                 (mapcat (fn [f] ["--ro-bind" "/dev/null" f]) (filter h/file? files))))))
+
+(defn env
+  "The environment a confined command sees: base keys from this process,
+  plus the granted profile secrets by name, plus its own TMPDIR."
+  [{:keys [env-allow]} tool-env tmpdir]
+  (merge (select-keys (h/process-env) base-env-keys)
+         (select-keys tool-env env-allow)
+         {"TMPDIR" tmpdir}))
+
+(defn command
+  "How to run `cmd` under `pol`. Returns {:argv [...] :env {...} :tmpdir dir
+  :sandbox kw} or {:refused reason}."
+  [pol {:keys [cmd write-roots tool-env home backend]}]
+  (if (and (= :host (:confinement pol)) (not (:peer? pol)))
+    {:argv ["/bin/sh" "-c" cmd] :env (merge (h/process-env) tool-env) :sandbox :host}
+    (let [tmpdir (h/mkdirs (h/join (h/tmp-dir) (str "itonami-term-" (h/random-hex 6))))
+          spec {:write-roots (vec (distinct (concat write-roots (:write-extra pol) [tmpdir])))
+                :home home :network? (:network? pol)}
+          env' (env pol tool-env tmpdir)]
+      (case backend
+        :seatbelt {:argv ["/usr/bin/sandbox-exec" "-p" (seatbelt-profile spec) "/bin/sh" "-c" cmd]
+                   :env env' :tmpdir tmpdir :sandbox :seatbelt}
+        :bwrap {:argv (into (bwrap-args spec) ["/bin/sh" "-c" cmd])
+                :env env' :tmpdir tmpdir :sandbox :bwrap}
+        (do (h/rm tmpdir)
+            {:refused (str "no OS sandbox on this host (need sandbox-exec or bwrap); "
+                           (if (:peer? pol)
+                             "turns run for a peer are never unconfined"
+                             "set :terminal {:confinement :host} in itonami.edn to run unconfined"))})))))

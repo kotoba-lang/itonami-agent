@@ -7,13 +7,14 @@
 
   `ctx` carries where a tool may act:
     {:cwd dir  :home profile-home  :roots [dirs writes may touch] | nil
-     :writes (atom [])  :timeout-ms n}
+     :writes (atom [])  :timeout-ms n  :terminal-policy (confine/policy ...)}
   :roots nil means unrestricted (local runs, like Hermes' local backend).
   A peer run always sets :roots to the bundle's materialized home, so a turn
   run on someone else's machine cannot write outside the copy it was given."
   (:require [clojure.string :as str]
             [promesa.core :as p]
-            [itonami.agent.host :as h]))
+            [itonami.agent.host :as h]
+            [itonami.agent.confine :as confine]))
 
 (defn- fn-schema [name desc props required]
   {"type" "function"
@@ -104,16 +105,29 @@
 
 ;; ---------------------------------------------------------------- tools
 
-(defn terminal [ctx {:strs [command timeout workdir]}]
-  (let [cwd (if workdir (resolve-path ctx workdir) (:cwd ctx))]
+(defn terminal
+  "A shell command under the OS sandbox of ctx's :terminal-policy (see
+  itonami.agent.confine): writes only inside the run's roots (or its cwd),
+  no secret stores, no network unless granted, only the env it names."
+  [ctx {:strs [command timeout workdir]}]
+  (let [cwd (if workdir (resolve-path ctx workdir) (:cwd ctx))
+        pol (or (:terminal-policy ctx) (confine/policy nil {}))]
     (if (and (:roots ctx) (not (writable? ctx cwd)))
       (err (str "workdir outside this run's roots: " cwd))
-      (let [r (h/run-process command {:shell true :cwd cwd
-                                      :timeout-ms (* 1000 (or timeout (:terminal-timeout-s ctx) 180))
-                                      :env (:tool-env ctx)})]
-        (ok {"output" (clip (str (:stdout r) (when-not (str/blank? (:stderr r)) (str "\n[stderr]\n" (:stderr r)))) 50000)
-             "exit_code" (:exit r)
-             "error" (when (:timed-out? r) "timeout")})))))
+      (let [c (confine/command pol {:cmd (str command)
+                                    :write-roots (or (:roots ctx) [(:cwd ctx)])
+                                    :tool-env (:tool-env ctx)
+                                    :home (or (:host-home ctx) (h/home-dir))
+                                    :backend (if (contains? ctx :sandbox-backend) (:sandbox-backend ctx) (confine/backend))})]
+        (if-let [why (:refused c)]
+          (err (str "terminal refused: " why))
+          (let [r (try (h/run-process (:argv c) {:cwd cwd :exact-env? true :env (:env c)
+                                                 :timeout-ms (* 1000 (or timeout (:terminal-timeout-s ctx) 180))})
+                       (finally (when (:tmpdir c) (h/rm (:tmpdir c)))))]
+            (ok {"output" (clip (str (:stdout r) (when-not (str/blank? (:stderr r)) (str "\n[stderr]\n" (:stderr r)))) 50000)
+                 "exit_code" (:exit r)
+                 "sandbox" (name (:sandbox c))
+                 "error" (when (:timed-out? r) "timeout")})))))))
 
 (defn read-file [ctx {:strs [path offset limit]}]
   (let [abs (resolve-path ctx path)]
