@@ -1,0 +1,275 @@
+(ns itonami.agent.confine
+  "The OS boundary around the tools that touch the host: `terminal`,
+  `read_file` and `search_files`. What an LLM asked for runs with what its
+  policy grants and nothing else:
+
+    writes   only the run's write roots and a per-run TMPDIR
+    reads    everything except the host's secret stores (ssh/cloud/gpg keys,
+             keychains, the node key, every .env / peer.env / secrets file);
+             a turn run for a peer reads nothing under the home directory
+             but its own roots and the toolchains on PATH, and gets the
+             per-run TMPDIR as HOME
+    network  none unless granted
+    env      PATH/HOME/locale/TERM + the profile secrets named in :env
+
+  Enforced by the kernel, not by parsing the command: macOS Seatbelt
+  (`sandbox-exec`), Linux bubblewrap (`bwrap`). With neither present the
+  command is refused (fail closed) unless the profile opts out with
+  `:terminal {:confinement :host}` -- and a turn run for a peer can never
+  opt out, because the requester wrote the bundle's itonami.edn.
+
+  Policy, in itonami.edn:
+    :terminal {:confinement :sandbox     ; default; :host = run unconfined
+               :network false            ; true = outbound network allowed
+               :env [\"GITHUB_TOKEN\"]     ; profile secrets passed by name
+               :write [\"~/notes\"]}       ; extra write roots (local runs)"
+  (:require [clojure.string :as str]
+            [itonami.agent.host :as h]))
+
+(def base-env-keys
+  ["PATH" "HOME" "USER" "LOGNAME" "SHELL" "LANG" "LC_ALL" "LC_CTYPE" "TERM" "TZ"])
+
+(defn- itonami-dir [] (h/expand (or (h/env "ITONAMI_DIR") "~/.itonami")))
+
+(defn secret-paths
+  "Directories and files under `home` a confined command may not read."
+  [home]
+  (let [j #(h/join home %)]
+    {:dirs (cond-> [(j ".ssh") (j ".aws") (j ".gnupg") (j ".kube") (j ".docker")
+                    (j ".config/gh") (j ".config/gcloud") (j ".azure") (j ".password-store")
+                    (j "Library/Keychains") (j ".itonami/node") (h/join (itonami-dir) "node")]
+             true vec)
+     :files (vec (concat [(j ".netrc") (j ".git-credentials") (j ".npmrc") (j ".pypirc")
+                          ;; the default home of the node key and peer.env is
+                          ;; protected even when ITONAMI_DIR points elsewhere
+                          (j ".itonami/peer.env") (h/join (itonami-dir) "peer.env") (j ".hermes/.env")]
+                         ;; bwrap cannot match by pattern: name each profile's .env
+                         (for [p (h/ls (j ".hermes/profiles"))] (j (str ".hermes/profiles/" p "/.env")))))
+     ;; any dotenv or secrets file anywhere: profile homes, workspaces, repos
+     :name-patterns ["\\.env$" "\\.env\\.[^/]*$" "/secrets\\.command$" "/auth\\.json$"]}))
+
+(defn policy
+  "The terminal policy of a run. `peer?` = a turn this node runs for
+  someone else: the bundle's own :terminal is ignored."
+  [itonami-edn {:keys [peer?]}]
+  (let [t (when-not peer? (:terminal itonami-edn))]
+    {:confinement (if peer? :sandbox (get t :confinement :sandbox))
+     :network? (boolean (and (not peer?) (:network t)))
+     :env-allow (vec (when-not peer? (:env t)))
+     :write-extra (vec (when-not peer? (map h/expand (:write t))))
+     ;; :all-but-secrets | :roots (home-dir reads limited to the run's roots)
+     :read-scope (if peer? :roots :all-but-secrets)
+     ;; web_extract host allowlist; nil = any public host. It only narrows,
+     ;; so a peer turn honours the bundle's
+     :web-allow (some-> (get-in itonami-edn [:web :allow]) vec)
+     :peer? (boolean peer?)}))
+
+(defn- under? [p dir] (or (= p dir) (str/starts-with? p (str dir "/"))))
+
+(defn- real [p] (try (h/realpath p) (catch :default _ p)))
+
+(defn- real-or-parent
+  "realpath of p, or of its nearest existing ancestor joined with the rest,
+  so a path that does not exist yet is judged where it would land."
+  [p]
+  (if (h/exists? p)
+    (real p)
+    (let [parent (h/dirname p)]
+      (if (= parent p) p (h/join (real-or-parent parent) (h/basename p))))))
+
+(defn path-home-dirs
+  "Toolchain dirs on PATH under `home` (and their parent when named bin/, for
+  the libs beside it): what a :roots-scoped command still needs to read."
+  [home]
+  (vec (distinct (for [d (str/split (or (h/env "PATH") "") #":")
+                       :when (and (seq d) (under? d home))
+                       x (if (= "bin" (h/basename d)) [d (h/dirname d)] [d])]
+                   x))))
+
+(defn read-denial
+  "Why an in-process tool (read_file, search_files) may not read `path` under
+  `pol`: :secret | :outside-roots, or nil when it may. Mirrors the sandbox:
+  secret stores never; under :roots scope nothing in the home directory
+  outside `roots`."
+  [pol {:keys [path roots home]}]
+  (when-not (and (= :host (:confinement pol)) (not (:peer? pol)))
+    (let [p (real-or-parent path)
+          home (real home)
+          {:keys [dirs files name-patterns]} (secret-paths home)]
+      (cond
+        (or (some #(under? p (real %)) dirs)
+            (some #(= p (real %)) files)
+            (some #(re-find (re-pattern %) p) name-patterns)) :secret
+        (and (= :roots (:read-scope pol))
+             (under? p home)
+             (not (some #(under? p (real %)) roots))) :outside-roots))))
+
+(defn readable? [pol opts] (nil? (read-denial pol opts)))
+
+(defn backend
+  "Which kernel sandbox this host offers: :seatbelt | :bwrap | nil."
+  []
+  (cond
+    (and (= "darwin" (.-platform js/process)) (h/file? "/usr/bin/sandbox-exec")) :seatbelt
+    (zero? (:exit (h/run-process ["/bin/sh" "-c" "command -v bwrap"] {}))) :bwrap
+    :else nil))
+
+(defn- sb-str [s] (str "\"" (-> s (str/replace "\\" "\\\\") (str/replace "\"" "\\\"")) "\""))
+
+(defn seatbelt-profile
+  "SBPL text for {:write-roots [...] :read-roots [...] :read-scope kw :home dir
+  :network? bool}. Later rules win, so the secret denials come last."
+  [{:keys [write-roots read-roots read-scope home network?]}]
+  (let [{:keys [dirs files name-patterns]} (secret-paths home)]
+    (str/join "\n"
+              (concat
+               ["(version 1)" "(allow default)"
+                "(deny file-write*)"
+                (str "(allow file-write* "
+                     (str/join " " (concat (for [r write-roots] (str "(subpath " (sb-str (real r)) ")"))
+                                           ["(literal \"/dev/null\")" "(literal \"/dev/zero\")"
+                                            "(regex #\"^/dev/tty\")" "(regex #\"^/dev/fd/\")"
+                                            "(literal \"/dev/dtracehelper\")"]))
+                     ")")]
+               ;; file-read-data, not file-read*: metadata stays readable so
+               ;; getcwd/cd through the home directory still resolve
+               (when (= :roots read-scope)
+                 [(str "(deny file-read-data (subpath " (sb-str (real home)) "))")
+                  (str "(allow file-read-data "
+                       (str/join " " (for [r (concat write-roots read-roots)] (str "(subpath " (sb-str (real r)) ")")))
+                       ")")])
+               (for [d dirs] (str "(deny file-read* file-write* (subpath " (sb-str (real d)) "))"))
+               (for [f files] (str "(deny file-read* file-write* (literal " (sb-str (real f)) "))"))
+               ;; #"..." is a regex literal: backslashes pass through as written
+               ;; (doubling them, as sb-str does, makes \\.env match nothing)
+               (for [p name-patterns] (str "(deny file-read* file-write* (regex #\"" (str/replace p "\"" "\\\"") "\"))"))
+               (when-not network? ["(deny network*)"])))))
+
+(def ^:private secret-file-find
+  ;; find(1) form of :name-patterns (bwrap cannot match by pattern)
+  ["(" "-name" "node_modules" "-o" "-name" ".git" ")" "-prune" "-o" "-type" "f"
+   "(" "-name" "*.env" "-o" "-name" "*.env.*" "-o" "-name" "secrets.command" "-o" "-name" "auth.json" ")" "-print"])
+
+(defn secret-files-under
+  "Every file matching :name-patterns under `dirs`, for bwrap to mask one by
+  one. nil when the scan does not finish in time (the caller refuses)."
+  [dirs]
+  (let [dirs (filter h/dir? dirs)]
+    (if (empty? dirs)
+      []
+      (let [r (h/run-process (into (into ["find"] dirs) secret-file-find) {:timeout-ms 15000})]
+        (when-not (:timed-out? r)
+          (vec (distinct (remove str/blank? (str/split-lines (:stdout r))))))))))
+
+(defn bwrap-args
+  "bubblewrap argv prefix for the same policy, or nil when the secret-file
+  scan did not finish. bwrap matches paths, not patterns, so it hides the
+  whole home directory (both read scopes -- narrower than Seatbelt's
+  :all-but-secrets) and shows back only the roots, the read roots and the
+  PATH toolchains, then masks each dotenv / secrets file found under them.
+  Mount order matters: empty home, roots on top, masks last."
+  [{:keys [write-roots read-roots home network?]}]
+  (let [{:keys [dirs files]} (secret-paths home)
+        shown (vec (distinct (concat write-roots read-roots)))
+        visible? (fn [p] (some #(under? p %) shown))
+        found (secret-files-under shown)]
+    (when found
+      (vec (concat ["bwrap" "--ro-bind" "/" "/" "--dev" "/dev" "--proc" "/proc"
+                    "--die-with-parent" "--new-session"]
+                   (when-not network? ["--unshare-net"])
+                   ["--tmpfs" home]
+                   (mapcat (fn [r] ["--ro-bind" r r]) (filter #(and (h/dir? %) (under? % home)) read-roots))
+                   (mapcat (fn [r] ["--bind" r r]) write-roots)
+                   (mapcat (fn [d] ["--tmpfs" d]) (filter #(and (h/dir? %) (visible? %)) dirs))
+                   (mapcat (fn [f] ["--ro-bind" "/dev/null" f])
+                           (distinct (concat (filter #(and (h/file? %) (visible? %)) files) found))))))))
+
+(defn env
+  "The environment a confined command sees: base keys from this process,
+  plus the granted profile secrets by name, plus its own TMPDIR (and, under
+  :roots scope, TMPDIR as HOME: the host's dotfiles are not its to read)."
+  [{:keys [env-allow read-scope]} tool-env tmpdir]
+  (merge (select-keys (h/process-env) base-env-keys)
+         (select-keys tool-env env-allow)
+         {"TMPDIR" tmpdir}
+         (when (= :roots read-scope) {"HOME" tmpdir})))
+
+(defn command
+  "How to run `cmd` (a shell line) or `argv` under `pol`. Returns {:argv [...]
+  :env {...} :tmpdir dir :sandbox kw} or {:refused reason}. `read-roots` are
+  extra dirs readable under :roots scope (the write roots always are)."
+  [pol {:keys [cmd argv write-roots read-roots tool-env home backend]}]
+  (let [run (or argv ["/bin/sh" "-c" cmd])]
+  (if (and (= :host (:confinement pol)) (not (:peer? pol)))
+    {:argv run :env (merge (h/process-env) tool-env) :sandbox :host}
+    (let [tmpdir (h/mkdirs (h/join (h/tmp-dir) (str "itonami-term-" (h/random-hex 6))))
+          spec {:write-roots (vec (distinct (concat write-roots (:write-extra pol) [tmpdir])))
+                :read-roots (vec (distinct (concat read-roots (path-home-dirs home))))
+                :read-scope (:read-scope pol)
+                :home home :network? (:network? pol)}
+          env' (env pol tool-env tmpdir)]
+      (case backend
+        :seatbelt {:argv (into ["/usr/bin/sandbox-exec" "-p" (seatbelt-profile spec)] run)
+                   :env env' :tmpdir tmpdir :sandbox :seatbelt}
+        :bwrap (if-let [pre (bwrap-args spec)]
+                 {:argv (into pre run) :env env' :tmpdir tmpdir :sandbox :bwrap}
+                 (do (h/rm tmpdir)
+                     {:refused "secret-file scan under the run's directories did not finish in 15 s"}))
+        (do (h/rm tmpdir)
+            {:refused (str "no OS sandbox on this host (need sandbox-exec or bwrap); "
+                           (if (:peer? pol)
+                             "turns run for a peer are never unconfined"
+                             "set :terminal {:confinement :host} in itonami.edn to run unconfined"))}))))))
+
+;; ---------------------------------------------------------------- audit (pilot)
+
+(def denial-signs
+  "stderr shapes a sandbox denial leaves: file ops (EPERM on Seatbelt, EROFS
+  under bwrap's read-only binds), DNS and connect
+  under (deny network*). A hint for the operator, not a verdict."
+  #"Operation not permitted|Read-only file system|Could not resolve host|Couldn't connect|Network is unreachable|nodename nor servname|getaddrinfo")
+
+(defn- audit-line! [m]
+  (try
+    (h/spit (h/join (itonami-dir) "logs" "terminal-sandbox.jsonl")
+            (str (h/json-str (merge {"ts" (h/iso-local)} m)) "\n")
+            {:append? true})
+    (catch :default _ nil)))
+
+(defn- clip200 [s] (let [s (str s)] (subs s 0 (min 200 (count s)))))
+
+(defn audit!
+  "One line per confined command in <itonami-dir>/logs/terminal-sandbox.jsonl,
+  so a rollout can see which turns the policy got in the way of."
+  [{:keys [profile peer? sandbox cmd exit stderr timed-out?]}]
+  (audit-line! {"tool" "terminal" "profile" profile "peer" (boolean peer?)
+                "sandbox" (name sandbox) "exit" exit "timed_out" (boolean timed-out?)
+                "suspected_denial" (boolean (and stderr (re-find denial-signs stderr)))
+                "cmd" (clip200 cmd)}))
+
+(defn audit-denied!
+  "One line per path read_file / search_files refused, in the same log.
+  `reason`: :secret (a secret store) | :outside-roots (home outside a peer
+  turn's roots)."
+  [{:keys [tool profile peer? path reason]}]
+  (audit-line! {"tool" tool "profile" profile "peer" (boolean peer?)
+                "denied" true "reason" (name reason) "path" (clip200 path)}))
+
+(defn- redact-url [url]
+  (try (let [u (js/URL. url)]
+         (str (.-origin u) (.-pathname u)
+              (when (seq (.-search u)) (str "?<" (dec (count (.-search u))) " chars>"))))
+       (catch :default _ "<not a URL>")))
+
+(defn audit-web!
+  "One line per web_extract URL or web_search query: fetched or refused, and
+  why. Neither the URL's query string nor the search text is kept -- only
+  their length and a hash -- since either may hold what a person typed."
+  [{:keys [tool profile peer? url query denied reason status redirects]}]
+  (audit-line! (cond-> {"tool" (or tool "web_extract") "profile" profile "peer" (boolean peer?)
+                        "denied" (boolean denied) "reason" (some-> reason name)
+                        "status" status "redirects" redirects}
+                 url (assoc "host" (try (.-host (js/URL. url)) (catch :default _ nil))
+                            "url" (clip200 (redact-url url)))
+                 query (assoc "query_chars" (count query)
+                              "query_sha256" (subs (h/sha256-hex query) 0 16)))))

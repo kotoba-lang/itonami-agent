@@ -1,5 +1,5 @@
 (ns itonami.agent.core-test
-  (:require [cljs.test :refer [deftest is testing]]
+  (:require [cljs.test :refer [deftest is testing async]]
             [clojure.string :as str]
             [itonami.agent.yaml :as yaml]
             [itonami.agent.host :as h]
@@ -7,7 +7,11 @@
             [itonami.agent.provider :as provider]
             [itonami.agent.cron :as cron]
             [itonami.agent.p2p :as p2p]
-            [itonami.agent.tools :as tools]))
+            [itonami.agent.tools :as tools]
+            [itonami.agent.confine :as confine]
+            [itonami.agent.webguard :as webguard]
+            [promesa.core :as p]
+            ["node:child_process" :as cp]))
 
 (deftest yaml-hermes-subset
   (let [y (yaml/parse "
@@ -126,3 +130,369 @@ plain: true
     (is (contains? (h/json-parse (tools/write-file ctx {"path" "a.txt" "content" "x"})) "bytes_written"))
     (is (str/includes? (get (h/json-parse (tools/write-file ctx {"path" "/tmp/itonami-escape.txt" "content" "x"})) "error") "outside"))
     (h/rm dir)))
+
+;; ---------------------------------------------------------------- terminal confinement
+;; The red-team cases A1-A6 of the kotoba CSF assessment, run against the
+;; `terminal` tool itself: each attack must leave its target untouched.
+
+(defn- term [ctx cmd] (h/json-parse (tools/terminal ctx {"command" cmd})))
+
+(deftest terminal-policy-shape
+  (testing "a bundle cannot unconfine a turn run for a peer"
+    (let [evil {:terminal {:confinement :host :network true :env ["NODE_KEY"] :write ["/"]}}
+          pol (confine/policy evil {:peer? true})]
+      (is (= :sandbox (:confinement pol)))
+      (is (false? (:network? pol)))
+      (is (empty? (:env-allow pol)))
+      (is (empty? (:write-extra pol)))))
+  (testing "local default is confined, offline, no secrets"
+    (is (= {:confinement :sandbox :network? false :env-allow [] :write-extra []
+            :read-scope :all-but-secrets :web-allow nil :peer? false}
+           (confine/policy nil {}))))
+  (testing "a peer turn reads only its roots under the home directory"
+    (is (= :roots (:read-scope (confine/policy {:terminal {:confinement :host}} {:peer? true})))))
+  (testing "no sandbox on the host: refuse, never fall back to a bare shell"
+    (let [dir (h/mkdirs (h/join (p2p/itonami-dir) "test-nobackend"))
+          r (term {:cwd dir :home dir :sandbox-backend nil
+                   :terminal-policy (confine/policy nil {})} "echo should-not-run")]
+      (is (str/starts-with? (get r "error") "terminal refused"))
+      (is (nil? (get r "output")))
+      (h/rm dir)))
+  (testing "a peer turn on a host without a sandbox is refused even if the bundle asks for :host"
+    (let [dir (h/mkdirs (h/join (p2p/itonami-dir) "test-nobackend-peer"))
+          r (term {:cwd dir :home dir :sandbox-backend nil
+                   :terminal-policy (confine/policy {:terminal {:confinement :host}} {:peer? true})} "echo x")]
+      (is (str/includes? (get r "error") "never unconfined"))
+      (h/rm dir))))
+
+(when (#{:seatbelt :bwrap} (confine/backend))
+  (deftest terminal-red-team
+    (let [base (h/mkdirs (h/join (p2p/itonami-dir) "test-redteam"))
+          ws (h/mkdirs (h/join base "ws"))
+          victim (h/join base "victim" "victim.txt")
+          fake-home (h/mkdirs (h/join base "home"))
+          ssh-key (h/join fake-home ".ssh" "id_ed25519")
+          dotenv (h/join ws "app" ".env")
+          ctx {:cwd ws :home ws :roots [ws] :writes (atom []) :host-home fake-home
+               :tool-env {"OPENROUTER_API_KEY" "sk-decoy" "GITHUB_TOKEN" "ghp-decoy"}
+               :terminal-policy (confine/policy nil {})}
+          intact? #(= "IMPORTANT BUSINESS DATA v1\n" (h/slurp victim))]
+      (h/spit victim "IMPORTANT BUSINESS DATA v1\n")
+      (h/spit ssh-key "DECOY-PRIVATE-KEY\n")
+      (h/spit dotenv "DB_PASSWORD=decoy\n")
+      (.symlinkSync (js/require "node:fs") victim (h/join ws "link.txt"))
+
+      (testing "C0 control: ordinary work inside the run's root still works"
+        (let [r (term ctx "echo built > out.txt && cat out.txt")]
+          (is (= (name (confine/backend)) (get r "sandbox")))
+          (is (= 0 (get r "exit_code")))
+          (is (str/includes? (get r "output") "built"))))
+
+      (testing "A1 ransomware: overwrite a file outside the roots"
+        (term ctx (str "echo ENCRYPTED > " victim))
+        (is (intact?)))
+      (testing "A2 traversal out of the root"
+        (term ctx "echo ENCRYPTED > ../victim/victim.txt")
+        (is (intact?)))
+      (testing "A3 symlink inside the root pointing out"
+        (term ctx "echo ENCRYPTED > link.txt")
+        (is (intact?)))
+      (testing "A1' delete instead of encrypt"
+        (term ctx (str "rm -rf " (h/dirname victim)))
+        (is (intact?)))
+
+      (testing "A4 exfiltration: read an ssh key and a dotenv"
+        (is (not (str/includes? (get (term ctx (str "cat " ssh-key)) "output") "DECOY-PRIVATE-KEY")))
+        (is (not (str/includes? (get (term ctx "cat app/.env") "output") "decoy")))
+        (is (not (str/includes? (get (term ctx (str "cp " ssh-key " stolen && cat stolen")) "output") "DECOY"))))
+
+      (testing "A5 credential theft through the environment"
+        (let [out (get (term ctx "env") "output")]
+          (is (not (str/includes? out "sk-decoy")))
+          (is (not (str/includes? out "ghp-decoy"))))
+        (testing "a secret named in :terminal :env is passed, and only that one"
+          (let [out (get (term (assoc ctx :terminal-policy (confine/policy {:terminal {:env ["GITHUB_TOKEN"]}} {})) "env") "output")]
+            (is (str/includes? out "ghp-decoy"))
+            (is (not (str/includes? out "sk-decoy"))))))
+
+      (testing "A6 lateral movement: a spawned shell inherits the same box"
+        (term ctx (str "/bin/sh -c 'touch " (h/join base "victim" "PWNED") "'"))
+        (is (not (h/exists? (h/join base "victim" "PWNED")))))
+
+      (testing "A10 C2 / exfil over the network, loopback included"
+        (let [;; a port the OS reports free (a random one can collide with a live local service)
+              port (js/parseInt (str/trim (:stdout (h/run-process ["node" "-e" "const s=require('net').createServer().listen(0,'127.0.0.1',()=>{console.log(s.address().port);s.close()})"] {}))))
+              srv (cp/spawn "node" #js ["-e" (str "require('http').createServer((q,r)=>r.end('SERVED')).listen(" port ")")]
+                            #js {:stdio "ignore"})]
+          (h/run-process ["/bin/sh" "-c" (str "for i in 1 2 3 4 5 6 7 8 9 10; do curl -s -m 1 http://127.0.0.1:" port "/ && exit 0; sleep 0.3; done")] {})
+          (try
+            (is (not (str/includes? (str (get (term ctx (str "curl -sS -m 3 http://127.0.0.1:" port "/")) "output")) "SERVED")) "denied by default")
+            (is (str/includes? (str (get (term (assoc ctx :terminal-policy (confine/policy {:terminal {:network true}} {}))
+                                             (str "curl -sS -m 3 http://127.0.0.1:" port "/")) "output")) "SERVED")
+                "granted with :terminal {:network true}")
+            (finally (.kill srv)))))
+
+      (testing "every confined command leaves an audit line; denials are flagged"
+        (let [lines (str/split-lines (h/slurp (h/join (p2p/itonami-dir) "logs" "terminal-sandbox.jsonl")))
+              recs (map h/json-parse lines)]
+          (is (every? #(= (name (confine/backend)) (get % "sandbox")) (filter #(= "terminal" (get % "tool")) recs)))
+          (is (some #(and (get % "suspected_denial") (str/includes? (get % "cmd") "ENCRYPTED")) recs))
+          (is (not (get (first (filter #(str/includes? (get % "cmd") "echo built") recs)) "suspected_denial")))))
+
+      (testing "the per-run TMPDIR is writable and removed afterwards"
+        (let [out (get (term ctx "echo t > \"$TMPDIR/t\" && cat \"$TMPDIR/t\" && echo \"$TMPDIR\"") "output")
+              tmp (str/trim (last (str/split-lines out)))]
+          (is (str/starts-with? out "t"))
+          (is (not (h/exists? tmp)))))
+      (h/rm base))))
+
+;; ---------------------------------------------------------------- read_file / search_files confinement
+
+(when (#{:seatbelt :bwrap} (confine/backend))
+  (deftest read-tools-red-team
+    (let [base (h/realpath (h/mkdirs (h/join (p2p/itonami-dir) "test-readtools")))
+          ws (h/mkdirs (h/join base "ws"))
+          ssh-key (h/join base ".ssh" "id_ed25519")
+          dotenv (h/join ws "app" ".env")
+          private (h/join base "Documents" "plan.txt")
+          ;; the host's home is `base`, so the run's root sits inside it, as on a real node
+          local {:cwd ws :home ws :roots [ws] :host-home base :terminal-policy (confine/policy nil {})}
+          bundle (h/mkdirs (h/join base ".itonami" "peer-runs" "bafktest"))
+          peer (assoc local :home bundle
+                      :terminal-policy (confine/policy {:terminal {:confinement :host}} {:peer? true}))
+          rd (fn [ctx p] (h/json-parse (tools/read-file ctx {"path" p})))
+          sr (fn [ctx p] (h/json-parse (tools/search-files ctx {"pattern" "DECOY" "path" p})))]
+      (h/spit ssh-key "DECOY-PRIVATE-KEY\n")
+      (h/spit dotenv "DB_PASSWORD=DECOY-env\n")
+      (h/spit private "DECOY-private-plan\n")
+      (h/spit (h/join ws "notes.txt") "DECOY-visible\n")
+      ;; not a dotfile: rg searches it by default, so only the sandbox keeps it out
+      (h/spit (h/join base "cfg" "auth.json") "{\"token\":\"DECOY-auth\"}\n")
+      (h/spit (h/join ws "auth.json") "{\"token\":\"DECOY-ws-auth\"}\n")
+
+      (testing "read_file: secret stores are unreadable, ordinary files are not"
+        (is (str/includes? (str (get (rd local ssh-key) "error")) "not readable"))
+        (is (str/includes? (str (get (rd local "app/.env") "error")) "not readable"))
+        (is (str/includes? (str (get (rd local "../.ssh/id_ed25519") "error")) "not readable") "traversal is resolved first")
+        (is (str/includes? (get (rd local "notes.txt") "content") "DECOY-visible"))
+        (is (str/includes? (get (rd local private) "content") "DECOY-private-plan") "local runs may read the rest of home"))
+
+      (testing "read_file: a symlink in the root pointing at a key is judged by its target"
+        (.symlinkSync (js/require "node:fs") ssh-key (h/join ws "key-link"))
+        (is (str/includes? (str (get (rd local "key-link") "error")) "not readable")))
+
+      (testing "read_file on a peer turn: nothing in home outside the run's roots"
+        (is (str/includes? (str (get (rd peer private) "error")) "not readable"))
+        (is (str/includes? (get (rd peer "/Users/nobody/x") "error") "not found") "outside home: ordinary rules")
+        (is (str/includes? (get (rd peer "notes.txt") "content") "DECOY-visible"))
+        (testing "the bundle it runs from stays readable (SOUL, data/)"
+          (h/spit (h/join bundle "data" "catalog.json") "{\"ok\":true}\n")
+          (is (str/includes? (str (get (rd peer (h/join bundle "data" "catalog.json")) "content")) "ok"))
+          (is (str/includes? (str (get (h/json-parse (tools/terminal peer {"command" (str "cat " (h/join bundle "data" "catalog.json"))})) "output")) "ok"))))
+
+      (testing "search_files over the whole home finds ordinary hits, never secret contents"
+        (let [out (str/join "\n" (get (sr local base) "matches"))]
+          (is (str/includes? out "DECOY-visible"))
+          (is (not (str/includes? out "DECOY-PRIVATE-KEY")))
+          (is (not (str/includes? out "DECOY-env")))
+          (is (not (str/includes? out "DECOY-auth")) "auth.json outside the root")
+          (is (not (str/includes? out "DECOY-ws-auth")) "auth.json inside the root")))
+
+      (testing "search_files on a peer turn cannot sweep the home directory"
+        (is (str/includes? (str (get (sr peer base) "error")) "not readable"))
+        (let [out (str/join "\n" (get (sr peer ws) "matches"))]
+          (is (str/includes? out "DECOY-visible"))
+          (is (not (str/includes? out "DECOY-env")))))
+
+      (testing "every refused read is in the audit log, with tool and reason"
+        (let [recs (map h/json-parse (str/split-lines (h/slurp (h/join (p2p/itonami-dir) "logs" "terminal-sandbox.jsonl"))))
+              denied (filter #(get % "denied") recs)
+              has? (fn [tool reason frag] (some #(and (= tool (get % "tool")) (= reason (get % "reason"))
+                                                      (str/includes? (get % "path") frag)) denied))]
+          (is (has? "read_file" "secret" "id_ed25519"))
+          (is (has? "read_file" "secret" ".env"))
+          (is (has? "read_file" "outside-roots" "plan.txt"))
+          (is (has? "search_files" "outside-roots" "test-readtools"))
+          (is (every? #(true? (get % "peer")) (filter #(= "outside-roots" (get % "reason")) denied)))
+          (is (not-any? #(str/includes? (str (get % "path")) "notes.txt") denied) "allowed reads are not logged")))
+
+      (testing "terminal on a peer turn: home outside the roots is unreadable, HOME is the run's TMPDIR"
+        (let [out (get (h/json-parse (tools/terminal peer {"command" (str "cat " private "; echo HOME=$HOME")})) "output")]
+          (is (not (str/includes? out "DECOY-private-plan")))
+          (is (not (str/includes? out (str "HOME=" base "\n"))))))
+      (h/rm base))))
+
+;; ---------------------------------------------------------------- web_extract confinement
+
+(deftest web-address-classes
+  (doseq [a ["127.0.0.1" "127.8.8.8" "10.1.2.3" "172.16.0.1" "172.31.255.255" "192.168.1.1"
+             "169.254.169.254" "100.100.100.100" "100.64.0.1" "0.0.0.0" "224.0.0.1" "255.255.255.255"
+             "::1" "::" "::ffff:127.0.0.1" "::ffff:7f00:1" "::ffff:a9fe:a9fe" "fe80::1" "fd00::1"
+             "64:ff9b::7f00:1" "2001:db8::1" "[::1]" "not-an-ip"]]
+    (is (webguard/blocked-address? a) a))
+  (doseq [a ["8.8.8.8" "1.1.1.1" "93.184.215.14" "100.63.255.255" "100.128.0.1" "172.32.0.1"
+             "2606:4700:4700::1111" "::ffff:8.8.8.8"]]
+    (is (not (webguard/blocked-address? a)) a))
+  (is (webguard/host-allowed? nil "anything.example"))
+  (is (webguard/host-allowed? ["*.go.jp"] "www.mhlw.go.jp"))
+  (is (not (webguard/host-allowed? ["*.go.jp"] "go.jp.evil.example")))
+  (is (not (webguard/host-allowed? ["example.org"] "sub.example.org"))))
+
+(deftest web-extract-red-team
+  (async done
+    (let [http (js/require "node:http")
+          internal (.createServer http (fn [_ ^js res] (.end res "INTERNAL-SECRET-DECOY")))
+          big (.repeat "x" (* 3 1024 1024))
+          public (.createServer http
+                   (fn [^js req ^js res]
+                     (let [u (.-url req)]
+                       (cond
+                         (= u "/ok") (.end res "<p>PUBLIC-PAGE</p>")
+                         (= u "/to-metadata") (do (.writeHead res 302 #js {"Location" "http://169.254.169.254/latest/meta-data/"}) (.end res))
+                         (= u "/to-lan") (do (.writeHead res 301 #js {"Location" "http://10.0.0.5/admin"}) (.end res))
+                         (= u "/loop") (do (.writeHead res 302 #js {"Location" "/loop"}) (.end res))
+                         (= u "/big") (.end res big)
+                         :else (do (.writeHead res 404) (.end res))))))
+          ports (atom {})
+          base (h/mkdirs (h/join (p2p/itonami-dir) "test-web"))
+          ctx {:cwd base :home base :profile "web-test" :terminal-policy (confine/policy nil {})}
+          pub-ctx (assoc ctx :web-public-override #{"127.0.0.1"})
+          fetch1 (fn [c u] (p/let [r (tools/web-extract c {"urls" [u]})] (first (get (h/json-parse r) "results"))))
+          denied? (fn [r frag] (and (nil? (get r "content")) (str/includes? (str (get r "error")) frag)))
+          finish (fn [] (.close internal) (.close public) (h/rm base) (done))]
+      (.listen internal 0 "127.0.0.1"
+        (fn []
+          (swap! ports assoc :internal (.-port (.address internal)))
+          (.listen public 0 "127.0.0.1"
+            (fn []
+              (swap! ports assoc :public (.-port (.address public)))
+              (let [ip (:internal @ports) pp (:public @ports)
+                    pub (fn [path] (str "http://127.0.0.1:" pp path))]
+                (-> (p/let [;; SSRF to this host, in every spelling the URL parser accepts
+                            r1 (fetch1 ctx (str "http://127.0.0.1:" ip "/"))
+                            r2 (fetch1 ctx (str "http://localhost:" ip "/"))
+                            r3 (fetch1 ctx (str "http://2130706433:" ip "/"))
+                            r4 (fetch1 ctx (str "http://0x7f.1:" ip "/"))
+                            r5 (fetch1 ctx (str "http://[::ffff:127.0.0.1]:" ip "/"))
+                            r6 (fetch1 ctx "http://169.254.169.254/latest/meta-data/")
+                            r7 (fetch1 ctx "file:///etc/passwd")
+                            r8 (fetch1 ctx "http://user:pass@example.com/")
+                            ;; a public page is fetched (control) ...
+                            c0 (fetch1 pub-ctx (pub "/ok"))
+                            ;; ... but its redirects into private space are not
+                            r9 (fetch1 pub-ctx (pub "/to-metadata"))
+                            r10 (fetch1 pub-ctx (pub "/to-lan"))
+                            r11 (fetch1 pub-ctx (pub "/loop"))
+                            r12 (fetch1 pub-ctx (pub "/big"))
+                            r13 (fetch1 (assoc pub-ctx :terminal-policy (confine/policy {:web {:allow ["example.org"]}} {})) (pub "/ok"))
+                            r14 (fetch1 (assoc pub-ctx :terminal-policy (confine/policy {:web {:allow ["example.org"]}} {:peer? true})) (pub "/ok"))]
+                      (testing "SSRF to loopback in every spelling is refused before connecting"
+                        (is (denied? r1 "non-public") "127.0.0.1")
+                        (is (denied? r2 "non-public") "localhost (judged at lookup)")
+                        (is (denied? r3 "non-public") "decimal 2130706433")
+                        (is (denied? r4 "non-public") "hex 0x7f.1")
+                        (is (denied? r5 "non-public") "v4-mapped IPv6")
+                        (is (not-any? #(str/includes? (str (get % "content")) "INTERNAL-SECRET") [r1 r2 r3 r4 r5])))
+                      (testing "cloud metadata, other schemes, credentials"
+                        (is (denied? r6 "non-public"))
+                        (is (denied? r7 "scheme"))
+                        (is (denied? r8 "credentials")))
+                      (testing "control: a public page is fetched"
+                        (is (str/includes? (str (get c0 "content")) "PUBLIC-PAGE")))
+                      (testing "redirects are judged hop by hop"
+                        (is (denied? r9 "non-public") "302 to cloud metadata")
+                        (is (denied? r10 "non-public") "301 to the LAN")
+                        (is (denied? r11 "too many redirects")))
+                      (testing "the body is capped"
+                        (is (true? (get r12 "truncated")))
+                        (is (<= (count (str (get r12 "content"))) 15100)))
+                      (testing ":web :allow narrows the hosts, on a peer turn too"
+                        (is (denied? r13 "not in :web :allow"))
+                        (is (denied? r14 "not in :web :allow")))
+                      (testing "every URL is in the audit log, refusals with their reason"
+                        (let [recs (filter #(= "web_extract" (get % "tool"))
+                                           (map h/json-parse (str/split-lines (h/slurp (h/join (p2p/itonami-dir) "logs" "terminal-sandbox.jsonl")))))]
+                          (is (some #(and (get % "denied") (= "private-address" (get % "reason"))) recs))
+                          (is (some #(and (get % "denied") (= "scheme" (get % "reason"))) recs))
+                          (is (some #(and (not (get % "denied")) (= 200 (get % "status"))) recs)))))
+                    (p/catch (fn [e] (is (nil? e) (str "web test crashed: " (.-message e)))))
+                    (p/finally (fn [_ _] (finish))))))))))))
+
+;; ---------------------------------------------------------------- web_search confinement
+
+(deftest search-query-shapes
+  (doseq [q ["厚生労働省 子ども 相談窓口" "やさしい日本語 学習 教材" "児童扶養手当 2026 改正"
+             "NPO 学習支援 無料 東京都" "ISO 27001 Annex A 8.2"]]
+    (is (nil? (webguard/query-refusal q)) q))
+  (doseq [[q why] [["" :empty-query]
+                   [(apply str (repeat 300 "a")) :query-too-long]
+                   ["sk-proj-abcdefghijklmnopqrstuvwx" :secret]
+                   ["token ghp_0123456789abcdefghijABCDEFGHIJ" :secret]
+                   ["AKIAIOSFODNN7EXAMPLE" :secret]
+                   ["-----BEGIN OPENSSH PRIVATE KEY-----" :secret]
+                   ["eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0" :secret]
+                   ["REJfUEFTU1dPUkQ9aHVudGVyMiBBUElfS0VZPXNrLWRlY295" :encoded-blob]
+                   ["相談者 taro.yamada@example.jp の件" :email]
+                   ["電話 090-1234-5678 の相談" :phone]
+                   ["+81 3 1234 5678" :phone]]]
+    (is (= why (webguard/query-refusal q)) q)))
+
+(deftest web-search-red-team
+  (async done
+    (let [http (js/require "node:http")
+          hits (atom 0)
+          serp (str "<div><a class=\"result__a\" href=\"//duckduckgo.com/l/?uddg=https%3A%2F%2Fwww.mhlw.go.jp%2F&rut=x\">厚生労働省</a>"
+                    "<a class=\"result__snippet\" href=\"x\">相談窓口の案内</a></div>")
+          engine (.createServer http (fn [^js req ^js res] (swap! hits inc) (.end res serp)))
+          base (h/mkdirs (h/join (p2p/itonami-dir) "test-search"))
+          log (h/join (p2p/itonami-dir) "logs" "terminal-sandbox.jsonl")]
+      (.listen engine 0 "127.0.0.1"
+        (fn []
+          (let [port (.-port (.address engine))
+                ctx {:cwd base :home base :profile "search-test" :terminal-policy (confine/policy nil {})
+                     :web-public-override #{"127.0.0.1"}
+                     :search-endpoint (str "http://127.0.0.1:" port "/html/?q=")}
+                search (fn [c q] (p/let [r (tools/web-search c {"query" q})] (h/json-parse r)))
+                leak "taro.yamada@example.jp"]
+            (-> (p/let [ok1 (search ctx "厚生労働省 子ども 相談窓口")
+                        n-after-ok @hits
+                        bad1 (search ctx (str "相談者 " leak " の件"))
+                        bad2 (search ctx "sk-proj-abcdefghijklmnopqrstuvwx")
+                        n-after-bad @hits
+                        al1 (search (assoc ctx :terminal-policy (confine/policy {:web {:allow ["*.go.jp"]}} {})) "厚生労働省")
+                        al2 (search (assoc ctx :terminal-policy (confine/policy {:web {:allow ["127.0.0.1"]}} {:peer? true})) "厚生労働省")
+                        _ (tools/web-extract ctx {"urls" [(str "http://127.0.0.1:" port "/html/?token=SECRET-IN-URL-DECOY")]})]
+                  (testing "control: an ordinary query is searched and parsed"
+                    (is (= 1 n-after-ok))
+                    (is (= "https://www.mhlw.go.jp/" (get-in ok1 ["results" 0 "url"]))))
+                  (testing "a query carrying personal data or a secret never leaves the host"
+                    (is (str/includes? (str (get bad1 "error")) "email"))
+                    (is (str/includes? (str (get bad2 "error")) "secret"))
+                    (is (= n-after-ok n-after-bad) "the engine saw no request"))
+                  (testing ":web :allow applies to search: unlisted engine refused, listed one used (peer turn too)"
+                    (is (str/includes? (str (get al1 "error")) "not in :web :allow"))
+                    (is (= "https://www.mhlw.go.jp/" (get-in al2 ["results" 0 "url"]))))
+                  (testing "the audit log keeps hashes and lengths, never the query or URL query text"
+                    (let [raw (h/slurp log)
+                          recs (filter #(= "web_search" (get % "tool")) (map h/json-parse (str/split-lines raw)))]
+                      (is (not (str/includes? raw leak)))
+                      (is (not (str/includes? raw "sk-proj-abcdefghij")))
+                      (is (not (str/includes? raw "SECRET-IN-URL-DECOY")))
+                      (is (some #(and (get % "denied") (= "email" (get % "reason")) (= 16 (count (get % "query_sha256")))) recs))
+                      (is (some #(and (not (get % "denied")) (= 200 (get % "status"))) recs)))))
+                (p/catch (fn [e] (is (nil? e) (str "search test crashed: " (.-message e)))))
+                (p/finally (fn [_ _] (.close engine) (h/rm base) (done))))))))))
+
+(deftest disabled-toolsets
+  (testing "agent.disabled_toolsets is subtracted after every enable, as in Hermes"
+    (is (= ["terminal" "read_file" "write_file" "patch" "search_files" "skill_view" "memory"]
+           (tools/enabled-tool-names ["hermes-cli"] ["web" "search" "browser" "x_search"])))
+    (is (= [] (tools/enabled-tool-names ["web"] ["web"])) "an explicit -t web cannot re-add it")
+    (is (= ["web_extract"] (tools/enabled-tool-names ["web"] ["search"])) "search removes web_search only")
+    (is (= (tools/tool-names ["hermes-cli"]) (tools/enabled-tool-names ["hermes-cli"] nil))))
+  (testing "a disabled tool cannot be called even if the model names it"
+    (let [names (tools/enabled-tool-names ["hermes-cli"] ["web"])]
+      (async done
+        (-> (tools/call {} names "web_search" "{\"query\":\"x\"}")
+            (p/then (fn [r] (is (str/includes? r "not available in this run"))))
+            (p/finally (fn [_ _] (done))))))))

@@ -81,9 +81,73 @@ requester (node A)                               peer (node B)
 - **Secrets never cross**. The executing peer pays inference with its own
   rail (`~/.itonami/peer.env` or its environment); `murakumo` is put on the
   chain when the profile's `:inference-rail` is `:murakumo`.
-- **Not a sandbox.** `terminal` on a peer is a real shell on that peer. Trust
-  is the boundary. The four conditions of ADR-2609242300 (gVisor/rootless
-  isolation, tunnel, cross-node resume, secret isolation) are still open.
+- **`terminal` runs in an OS sandbox** (`itonami.agent.confine`): macOS
+  Seatbelt (`sandbox-exec`) or Linux `bwrap`. Writes reach only the run's
+  roots and a per-run `TMPDIR`; ssh/cloud/gpg keys, keychains, the node key
+  and every `.env` / `peer.env` are unreadable (also to `read_file` and
+  `search_files`); there is no network; the env is `PATH`/`HOME`/locale/`TERM`
+  only. With no sandbox on the host the command
+  is refused. A turn run for a peer always gets this policy: the bundle's
+  `itonami.edn` cannot widen it. The remaining conditions of ADR-2609242300
+  (tunnel, cross-node resume) are still open.
+
+### Linux (bwrap) differs from macOS (Seatbelt)
+
+bwrap matches paths, not patterns. Under it the whole home directory is an
+empty tmpfs for every run, local ones too, and only the run's roots, the
+profile home and the PATH toolchains are shown back; each `*.env`,
+`*.env.*`, `secrets.command` and `auth.json` found under them (node_modules
+and .git pruned) is masked with /dev/null. If that scan takes over 15 s the
+command is refused. So a local run on Linux sees less of the home directory
+than on macOS, and a dotenv outside the home directory (e.g. /srv/app/.env)
+is not masked there. Verified on Linux 6.15 / bubblewrap 0.8.0 in a
+container (2026-10-09): the same 193 assertions pass, and with the sandbox
+bypassed 18 attack assertions fail.
+
+## Terminal policy
+
+Local runs read `:terminal` from the profile's `itonami.edn`:
+
+```clojure
+:terminal {:confinement :sandbox     ; default; :host = run unconfined (local only)
+           :network true             ; outbound network (default: none)
+           :env ["GITHUB_TOKEN"]     ; profile secrets passed to commands, by name
+           :write ["~/notes"]}       ; extra write roots
+```
+
+A profile without `:terminal` gets the default: sandboxed, offline, no
+secrets, writes confined to its terminal cwd.
+
+`read_file` and `search_files` follow the same read rules: the secret stores
+are refused before the file is even looked up (a symlink is judged by its
+target), and `search_files` runs `rg` / `grep` / `find` inside the sandbox,
+so a search over a broad path skips them. A turn run for a peer reads
+nothing under the home directory except its own roots, the bundle it runs
+from and the toolchains on `PATH`; its commands get the per-run `TMPDIR` as
+`HOME`.
+
+`web_extract` goes through `itonami.agent.webguard`: http(s) only, no
+credentials in the URL, and every address the host resolves to must be
+public -- loopback, private, link-local (cloud metadata), CGNAT (tailscale),
+multicast and reserved ranges are refused, judged inside the socket's own
+lookup so a DNS answer cannot change between check and connect. Redirects
+are followed by hand (at most 5), each hop judged again; bodies are cut at
+2 MB. To limit where a profile may fetch from at all:
+
+```clojure
+:web {:allow ["www.mhlw.go.jp" "*.go.jp"]}   ; exact names or *.suffix
+```
+
+A bundle can only narrow this, so a peer turn honours it. Every URL, fetched
+or refused, is a line in `~/.itonami/logs/terminal-sandbox.jsonl`, with its
+query string reduced to a length.
+
+`web_search` uses the same fetch (so a profile with `:web :allow` must list
+`html.duckduckgo.com` to search) and checks the query before it leaves the
+host: queries over 256 chars, or carrying API keys / private keys / JWTs,
+40+ char encoded blobs, e-mail addresses or phone numbers are refused. These
+are pattern checks, not a guarantee. The audit line keeps the query's length
+and a sha256 prefix, never its text.
 
 ### Decentralised inference (no third-party relay)
 

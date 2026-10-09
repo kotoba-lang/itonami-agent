@@ -7,13 +7,15 @@
 
   `ctx` carries where a tool may act:
     {:cwd dir  :home profile-home  :roots [dirs writes may touch] | nil
-     :writes (atom [])  :timeout-ms n}
+     :writes (atom [])  :timeout-ms n  :terminal-policy (confine/policy ...)}
   :roots nil means unrestricted (local runs, like Hermes' local backend).
   A peer run always sets :roots to the bundle's materialized home, so a turn
   run on someone else's machine cannot write outside the copy it was given."
   (:require [clojure.string :as str]
             [promesa.core :as p]
-            [itonami.agent.host :as h]))
+            [itonami.agent.host :as h]
+            [itonami.agent.confine :as confine]
+            [itonami.agent.webguard :as webguard]))
 
 (defn- fn-schema [name desc props required]
   {"type" "function"
@@ -82,6 +84,15 @@
   [sets]
   (vec (distinct (mapcat #(get toolsets % []) sets))))
 
+(defn enabled-tool-names
+  "Requested toolsets minus the profile's `agent.disabled_toolsets` (Hermes
+  config.yaml; Hermes subtracts them last, after every enable, and so do
+  we). A toolset itonami-agent does not implement (browser, x_search) names
+  no tools here and subtracts nothing."
+  [requested disabled]
+  (let [off (set (tool-names disabled))]
+    (vec (remove off (tool-names requested)))))
+
 (defn tool-schemas [names] (vec (keep schemas names)))
 
 ;; ---------------------------------------------------------------- helpers
@@ -97,6 +108,25 @@
   (or (nil? (:roots ctx))
       (some #(or (= abs %) (str/starts-with? abs (str % "/"))) (:roots ctx))))
 
+(defn- policy [ctx] (or (:terminal-policy ctx) (confine/policy nil {})))
+(defn- host-home [ctx] (or (:host-home ctx) (h/home-dir)))
+(defn- backend [ctx] (if (contains? ctx :sandbox-backend) (:sandbox-backend ctx) (confine/backend)))
+
+(defn- read-roots
+  "Readable under :roots scope: the run's roots plus the profile home it runs
+  from (on a peer, the materialized bundle: SOUL, data/, skills)."
+  [ctx]
+  (vec (distinct (remove nil? (concat (or (:roots ctx) [(:cwd ctx)]) [(:home ctx)])))))
+
+(defn- readable?
+  "Whether `tool` may read `abs`; a refusal is written to the sandbox audit log."
+  [ctx tool abs]
+  (let [pol (policy ctx)
+        why (confine/read-denial pol {:path abs :roots (read-roots ctx) :home (host-home ctx)})]
+    (when why
+      (confine/audit-denied! {:tool tool :profile (:profile ctx) :peer? (:peer? pol) :path abs :reason why}))
+    (nil? why)))
+
 (defn- record-write! [ctx abs]
   (when-let [w (:writes ctx)] (swap! w conj abs)))
 
@@ -104,21 +134,41 @@
 
 ;; ---------------------------------------------------------------- tools
 
-(defn terminal [ctx {:strs [command timeout workdir]}]
-  (let [cwd (if workdir (resolve-path ctx workdir) (:cwd ctx))]
+(defn terminal
+  "A shell command under the OS sandbox of ctx's :terminal-policy (see
+  itonami.agent.confine): writes only inside the run's roots (or its cwd),
+  no secret stores, no network unless granted, only the env it names."
+  [ctx {:strs [command timeout workdir]}]
+  (let [cwd (if workdir (resolve-path ctx workdir) (:cwd ctx))
+        pol (policy ctx)]
     (if (and (:roots ctx) (not (writable? ctx cwd)))
       (err (str "workdir outside this run's roots: " cwd))
-      (let [r (h/run-process command {:shell true :cwd cwd
-                                      :timeout-ms (* 1000 (or timeout (:terminal-timeout-s ctx) 180))
-                                      :env (:tool-env ctx)})]
-        (ok {"output" (clip (str (:stdout r) (when-not (str/blank? (:stderr r)) (str "\n[stderr]\n" (:stderr r)))) 50000)
-             "exit_code" (:exit r)
-             "error" (when (:timed-out? r) "timeout")})))))
+      (let [c (confine/command pol {:cmd (str command)
+                                    :write-roots (or (:roots ctx) [(:cwd ctx)])
+                                    :read-roots (read-roots ctx)
+                                    :tool-env (:tool-env ctx)
+                                    :home (host-home ctx)
+                                    :backend (backend ctx)})]
+        (if-let [why (:refused c)]
+          (err (str "terminal refused: " why))
+          (let [r (try (h/run-process (:argv c) {:cwd cwd :exact-env? true :env (:env c)
+                                                 :timeout-ms (* 1000 (or timeout (:terminal-timeout-s ctx) 180))})
+                       (finally (when (:tmpdir c) (h/rm (:tmpdir c)))))]
+            (confine/audit! {:profile (:profile ctx) :peer? (:peer? pol) :sandbox (:sandbox c)
+                             :cmd (str command) :exit (:exit r) :stderr (:stderr r)
+                             :timed-out? (:timed-out? r)})
+            (ok {"output" (clip (str (:stdout r) (when-not (str/blank? (:stderr r)) (str "\n[stderr]\n" (:stderr r)))) 50000)
+                 "exit_code" (:exit r)
+                 "sandbox" (name (:sandbox c))
+                 "error" (when (:timed-out? r) "timeout")})))))))
 
 (defn read-file [ctx {:strs [path offset limit]}]
   (let [abs (resolve-path ctx path)]
-    (if-not (h/file? abs)
-      (err (str "file not found: " abs))
+    (cond
+      ;; checked before existence, so a denied path does not leak whether it exists
+      (not (readable? ctx "read_file" abs)) (err (str "path not readable under this run's policy: " abs))
+      (not (h/file? abs)) (err (str "file not found: " abs))
+      :else
       (let [ls (str/split-lines (h/slurp abs))
             off (max 1 (or offset 1))
             lim (min 2000 (or limit 2000))
@@ -150,19 +200,31 @@
                     (record-write! ctx abs)
                     (ok {"replacements" (if replace_all n 1) "path" abs})))))))
 
-(defn search-files [ctx {:strs [pattern target path file_glob limit]}]
+(defn search-files
+  "rg / grep / find, run under the same sandbox as `terminal` (read-only,
+  offline), so a search over a broad path cannot read the secret stores
+  inside it -- and under :roots scope nothing in the home directory but the
+  run's roots."
+  [ctx {:strs [pattern target path file_glob limit]}]
   (let [dir (resolve-path ctx (or path "."))
-        lim (or limit 50)
-        rg? (zero? (:exit (h/run-process ["which" "rg"] {})))
-        r (if (= target "files")
-            (if rg?
-              (h/run-process ["rg" "--files" "-g" pattern dir] {:timeout-ms 30000})
-              (h/run-process ["find" dir "-name" pattern] {:timeout-ms 30000}))
-            (if rg?
-              (h/run-process (cond-> ["rg" "-n" "--no-heading" "-m" "20"] file_glob (into ["-g" file_glob]) true (into ["-e" pattern dir])) {:timeout-ms 30000})
-              (h/run-process ["grep" "-rnE" pattern dir] {:timeout-ms 30000})))
-        hits (take lim (remove str/blank? (str/split-lines (:stdout r))))]
-    (ok {"matches" (vec hits) "count" (count hits)})))
+        lim (or limit 50)]
+    (if-not (readable? ctx "search_files" dir)
+      (err (str "path not readable under this run's policy: " dir))
+      (let [rg? (zero? (:exit (h/run-process ["which" "rg"] {})))
+            argv (if (= target "files")
+                   (if rg? ["rg" "--files" "-g" pattern dir] ["find" dir "-name" pattern])
+                   (if rg?
+                     (cond-> ["rg" "-n" "--no-heading" "-m" "20"] file_glob (into ["-g" file_glob]) true (into ["-e" pattern dir]))
+                     ["grep" "-rnE" pattern dir]))
+            c (confine/command (assoc (policy ctx) :network? false :write-extra [])
+                               {:argv argv :write-roots [] :read-roots (read-roots ctx)
+                                :tool-env {} :home (host-home ctx) :backend (backend ctx)})]
+        (if-let [why (:refused c)]
+          (err (str "search_files refused: " why))
+          (let [r (try (h/run-process (:argv c) {:exact-env? true :env (:env c) :timeout-ms 30000})
+                       (finally (when (:tmpdir c) (h/rm (:tmpdir c)))))
+                hits (take lim (remove str/blank? (str/split-lines (:stdout r))))]
+            (ok {"matches" (vec hits) "count" (count hits)})))))))
 
 (defn- strip-html [html]
   (-> html
@@ -173,30 +235,58 @@
       (str/replace #"&gt;" ">") (str/replace #"&quot;" "\"") (str/replace #"&#39;" "'")
       (str/replace #"[ \t]+" " ") (str/replace #"\n\s*\n+" "\n\n") str/trim))
 
-(defn- fetch-text [url]
-  (-> (js/fetch url #js {:headers #js {"User-Agent" "Mozilla/5.0 (compatible; itonami-agent/0.1; +https://itonami.cloud)"}
-                         :redirect "follow"})
-      (p/then (fn [^js r] (p/let [t (.text r)] {:status (.-status r) :text t})))))
+(defn web-extract
+  "Fetch up to 5 URLs through itonami.agent.webguard: public addresses only
+  (no loopback / LAN / tailscale / cloud metadata, judged at connect time),
+  http(s) only, redirects re-checked, 2 MB cap, and the profile's
+  :web :allow when set. Each URL is one line in the sandbox audit log."
+  [ctx {:strs [urls char_limit]}]
+  (let [pol (policy ctx)
+        audit (fn [m] (confine/audit-web! (merge {:profile (:profile ctx) :peer? (:peer? pol)} m)))]
+    (p/let [res (p/all (for [u (take 5 urls)]
+                         (-> (webguard/fetch-text (str u) {:allow (:web-allow pol)
+                                                           :public-override (:web-public-override ctx #{})})
+                             (p/then (fn [{:keys [status text redirects truncated?]}]
+                                       (audit {:url (str u) :status status :redirects redirects})
+                                       (cond-> {"url" u "status" status "content" (clip (strip-html text) (or char_limit 15000))}
+                                         truncated? (assoc "truncated" true))))
+                             (p/catch (fn [e]
+                                        (let [reason (:denied (ex-data e))]
+                                          (audit {:url (str u) :denied (boolean reason) :reason (or reason :error)})
+                                          {"url" u "error" (.-message e)}))))))]
+      (ok {"results" (vec res)}))))
 
-(defn web-extract [_ctx {:strs [urls char_limit]}]
-  (p/let [res (p/all (for [u (take 5 urls)]
-                       (-> (fetch-text u)
-                           (p/then (fn [{:keys [status text]}]
-                                     {"url" u "status" status "content" (clip (strip-html text) (or char_limit 15000))}))
-                           (p/catch (fn [e] {"url" u "error" (.-message e)})))))]
-    (ok {"results" (vec res)})))
+(def search-endpoint "https://html.duckduckgo.com/html/?q=")
 
-(defn web-search [_ctx {:strs [query limit]}]
-  ;; keyless HTML endpoint; Hermes' paid search backends are not assumed
-  (-> (fetch-text (str "https://html.duckduckgo.com/html/?q=" (js/encodeURIComponent query)))
-      (p/then (fn [{:keys [text]}]
-                (let [hits (->> (re-seq #"(?s)class=\"result__a\" href=\"([^\"]+)\"[^>]*>(.*?)</a>.*?class=\"result__snippet\"[^>]*>(.*?)</a>" text)
-                                (map (fn [[_ href title snip]]
-                                       (let [u (or (some-> (re-find #"uddg=([^&]+)" href) second js/decodeURIComponent) href)]
-                                         {"url" u "title" (strip-html title) "description" (strip-html snip)})))
-                                (take (or limit 8)))]
-                  (ok {"results" (vec hits)}))))
-      (p/catch (fn [e] (err (str "web_search: " (.-message e)))))))
+(defn web-search
+  "Keyless DuckDuckGo HTML search through itonami.agent.webguard (public
+  address, 2 MB cap, the profile's :web :allow -- a profile with an
+  allowlist must list html.duckduckgo.com to search). The query is checked
+  before it leaves the host: no secrets, encoded blobs, e-mail addresses or
+  phone numbers, at most 256 chars. The audit log keeps its length and
+  hash, never its text."
+  [ctx {:strs [query limit]}]
+  (let [pol (policy ctx)
+        q (str query)
+        audit (fn [m] (confine/audit-web! (merge {:tool "web_search" :profile (:profile ctx) :peer? (:peer? pol) :query q} m)))]
+    (if-let [why (webguard/query-refusal q)]
+      (do (audit {:denied true :reason why})
+          (p/resolved (err (str "web_search refused: query looks like it carries " (name why)
+                                " -- search with general words, not with secrets or a person's details"))))
+      (-> (webguard/fetch-text (str (:search-endpoint ctx search-endpoint) (js/encodeURIComponent q))
+                               {:allow (:web-allow pol) :public-override (:web-public-override ctx #{})})
+          (p/then (fn [{:keys [text status]}]
+                    (audit {:status status})
+                    (let [hits (->> (re-seq #"(?s)class=\"result__a\" href=\"([^\"]+)\"[^>]*>(.*?)</a>.*?class=\"result__snippet\"[^>]*>(.*?)</a>" text)
+                                    (map (fn [[_ href title snip]]
+                                           (let [u (or (some-> (re-find #"uddg=([^&]+)" href) second js/decodeURIComponent) href)]
+                                             {"url" u "title" (strip-html title) "description" (strip-html snip)})))
+                                    (take (or limit 8)))]
+                      (ok {"results" (vec hits)}))))
+          (p/catch (fn [e]
+                     (let [reason (:denied (ex-data e))]
+                       (audit {:denied (boolean reason) :reason (or reason :error)})
+                       (err (str "web_search: " (.-message e))))))))))
 
 (defn skill-view [ctx {:strs [name file_path]}]
   (let [skills (h/join (:home ctx) "skills")
