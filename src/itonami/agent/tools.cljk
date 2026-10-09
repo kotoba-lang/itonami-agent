@@ -14,7 +14,8 @@
   (:require [clojure.string :as str]
             [promesa.core :as p]
             [itonami.agent.host :as h]
-            [itonami.agent.confine :as confine]))
+            [itonami.agent.confine :as confine]
+            [itonami.agent.webguard :as webguard]))
 
 (defn- fn-schema [name desc props required]
   {"type" "function"
@@ -230,13 +231,26 @@
                          :redirect "follow"})
       (p/then (fn [^js r] (p/let [t (.text r)] {:status (.-status r) :text t})))))
 
-(defn web-extract [_ctx {:strs [urls char_limit]}]
-  (p/let [res (p/all (for [u (take 5 urls)]
-                       (-> (fetch-text u)
-                           (p/then (fn [{:keys [status text]}]
-                                     {"url" u "status" status "content" (clip (strip-html text) (or char_limit 15000))}))
-                           (p/catch (fn [e] {"url" u "error" (.-message e)})))))]
-    (ok {"results" (vec res)})))
+(defn web-extract
+  "Fetch up to 5 URLs through itonami.agent.webguard: public addresses only
+  (no loopback / LAN / tailscale / cloud metadata, judged at connect time),
+  http(s) only, redirects re-checked, 2 MB cap, and the profile's
+  :web :allow when set. Each URL is one line in the sandbox audit log."
+  [ctx {:strs [urls char_limit]}]
+  (let [pol (policy ctx)
+        audit (fn [m] (confine/audit-web! (merge {:profile (:profile ctx) :peer? (:peer? pol)} m)))]
+    (p/let [res (p/all (for [u (take 5 urls)]
+                         (-> (webguard/fetch-text (str u) {:allow (:web-allow pol)
+                                                           :public-override (:web-public-override ctx #{})})
+                             (p/then (fn [{:keys [status text redirects truncated?]}]
+                                       (audit {:url (str u) :status status :redirects redirects})
+                                       (cond-> {"url" u "status" status "content" (clip (strip-html text) (or char_limit 15000))}
+                                         truncated? (assoc "truncated" true))))
+                             (p/catch (fn [e]
+                                        (let [reason (:denied (ex-data e))]
+                                          (audit {:url (str u) :denied (boolean reason) :reason (or reason :error)})
+                                          {"url" u "error" (.-message e)}))))))]
+      (ok {"results" (vec res)}))))
 
 (defn web-search [_ctx {:strs [query limit]}]
   ;; keyless HTML endpoint; Hermes' paid search backends are not assumed

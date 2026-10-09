@@ -1,5 +1,5 @@
 (ns itonami.agent.core-test
-  (:require [cljs.test :refer [deftest is testing]]
+  (:require [cljs.test :refer [deftest is testing async]]
             [clojure.string :as str]
             [itonami.agent.yaml :as yaml]
             [itonami.agent.host :as h]
@@ -9,6 +9,8 @@
             [itonami.agent.p2p :as p2p]
             [itonami.agent.tools :as tools]
             [itonami.agent.confine :as confine]
+            [itonami.agent.webguard :as webguard]
+            [promesa.core :as p]
             ["node:child_process" :as cp]))
 
 (deftest yaml-hermes-subset
@@ -145,7 +147,7 @@ plain: true
       (is (empty? (:write-extra pol)))))
   (testing "local default is confined, offline, no secrets"
     (is (= {:confinement :sandbox :network? false :env-allow [] :write-extra []
-            :read-scope :all-but-secrets :peer? false}
+            :read-scope :all-but-secrets :web-allow nil :peer? false}
            (confine/policy nil {}))))
   (testing "a peer turn reads only its roots under the home directory"
     (is (= :roots (:read-scope (confine/policy {:terminal {:confinement :host}} {:peer? true})))))
@@ -319,3 +321,99 @@ plain: true
           (is (not (str/includes? out "DECOY-private-plan")))
           (is (not (str/includes? out (str "HOME=" base "\n"))))))
       (h/rm base))))
+
+;; ---------------------------------------------------------------- web_extract confinement
+
+(deftest web-address-classes
+  (doseq [a ["127.0.0.1" "127.8.8.8" "10.1.2.3" "172.16.0.1" "172.31.255.255" "192.168.1.1"
+             "169.254.169.254" "100.100.100.100" "100.64.0.1" "0.0.0.0" "224.0.0.1" "255.255.255.255"
+             "::1" "::" "::ffff:127.0.0.1" "::ffff:7f00:1" "::ffff:a9fe:a9fe" "fe80::1" "fd00::1"
+             "64:ff9b::7f00:1" "2001:db8::1" "[::1]" "not-an-ip"]]
+    (is (webguard/blocked-address? a) a))
+  (doseq [a ["8.8.8.8" "1.1.1.1" "93.184.215.14" "100.63.255.255" "100.128.0.1" "172.32.0.1"
+             "2606:4700:4700::1111" "::ffff:8.8.8.8"]]
+    (is (not (webguard/blocked-address? a)) a))
+  (is (webguard/host-allowed? nil "anything.example"))
+  (is (webguard/host-allowed? ["*.go.jp"] "www.mhlw.go.jp"))
+  (is (not (webguard/host-allowed? ["*.go.jp"] "go.jp.evil.example")))
+  (is (not (webguard/host-allowed? ["example.org"] "sub.example.org"))))
+
+(deftest web-extract-red-team
+  (async done
+    (let [http (js/require "node:http")
+          internal (.createServer http (fn [_ ^js res] (.end res "INTERNAL-SECRET-DECOY")))
+          big (.repeat "x" (* 3 1024 1024))
+          public (.createServer http
+                   (fn [^js req ^js res]
+                     (let [u (.-url req)]
+                       (cond
+                         (= u "/ok") (.end res "<p>PUBLIC-PAGE</p>")
+                         (= u "/to-metadata") (do (.writeHead res 302 #js {"Location" "http://169.254.169.254/latest/meta-data/"}) (.end res))
+                         (= u "/to-lan") (do (.writeHead res 301 #js {"Location" "http://10.0.0.5/admin"}) (.end res))
+                         (= u "/loop") (do (.writeHead res 302 #js {"Location" "/loop"}) (.end res))
+                         (= u "/big") (.end res big)
+                         :else (do (.writeHead res 404) (.end res))))))
+          ports (atom {})
+          base (h/mkdirs (h/join (p2p/itonami-dir) "test-web"))
+          ctx {:cwd base :home base :profile "web-test" :terminal-policy (confine/policy nil {})}
+          pub-ctx (assoc ctx :web-public-override #{"127.0.0.1"})
+          fetch1 (fn [c u] (p/let [r (tools/web-extract c {"urls" [u]})] (first (get (h/json-parse r) "results"))))
+          denied? (fn [r frag] (and (nil? (get r "content")) (str/includes? (str (get r "error")) frag)))
+          finish (fn [] (.close internal) (.close public) (h/rm base) (done))]
+      (.listen internal 0 "127.0.0.1"
+        (fn []
+          (swap! ports assoc :internal (.-port (.address internal)))
+          (.listen public 0 "127.0.0.1"
+            (fn []
+              (swap! ports assoc :public (.-port (.address public)))
+              (let [ip (:internal @ports) pp (:public @ports)
+                    pub (fn [path] (str "http://127.0.0.1:" pp path))]
+                (-> (p/let [;; SSRF to this host, in every spelling the URL parser accepts
+                            r1 (fetch1 ctx (str "http://127.0.0.1:" ip "/"))
+                            r2 (fetch1 ctx (str "http://localhost:" ip "/"))
+                            r3 (fetch1 ctx (str "http://2130706433:" ip "/"))
+                            r4 (fetch1 ctx (str "http://0x7f.1:" ip "/"))
+                            r5 (fetch1 ctx (str "http://[::ffff:127.0.0.1]:" ip "/"))
+                            r6 (fetch1 ctx "http://169.254.169.254/latest/meta-data/")
+                            r7 (fetch1 ctx "file:///etc/passwd")
+                            r8 (fetch1 ctx "http://user:pass@example.com/")
+                            ;; a public page is fetched (control) ...
+                            c0 (fetch1 pub-ctx (pub "/ok"))
+                            ;; ... but its redirects into private space are not
+                            r9 (fetch1 pub-ctx (pub "/to-metadata"))
+                            r10 (fetch1 pub-ctx (pub "/to-lan"))
+                            r11 (fetch1 pub-ctx (pub "/loop"))
+                            r12 (fetch1 pub-ctx (pub "/big"))
+                            r13 (fetch1 (assoc pub-ctx :terminal-policy (confine/policy {:web {:allow ["example.org"]}} {})) (pub "/ok"))
+                            r14 (fetch1 (assoc pub-ctx :terminal-policy (confine/policy {:web {:allow ["example.org"]}} {:peer? true})) (pub "/ok"))]
+                      (testing "SSRF to loopback in every spelling is refused before connecting"
+                        (is (denied? r1 "non-public") "127.0.0.1")
+                        (is (denied? r2 "non-public") "localhost (judged at lookup)")
+                        (is (denied? r3 "non-public") "decimal 2130706433")
+                        (is (denied? r4 "non-public") "hex 0x7f.1")
+                        (is (denied? r5 "non-public") "v4-mapped IPv6")
+                        (is (not-any? #(str/includes? (str (get % "content")) "INTERNAL-SECRET") [r1 r2 r3 r4 r5])))
+                      (testing "cloud metadata, other schemes, credentials"
+                        (is (denied? r6 "non-public"))
+                        (is (denied? r7 "scheme"))
+                        (is (denied? r8 "credentials")))
+                      (testing "control: a public page is fetched"
+                        (is (str/includes? (str (get c0 "content")) "PUBLIC-PAGE")))
+                      (testing "redirects are judged hop by hop"
+                        (is (denied? r9 "non-public") "302 to cloud metadata")
+                        (is (denied? r10 "non-public") "301 to the LAN")
+                        (is (denied? r11 "too many redirects")))
+                      (testing "the body is capped"
+                        (is (true? (get r12 "truncated")))
+                        (is (<= (count (str (get r12 "content"))) 15100)))
+                      (testing ":web :allow narrows the hosts, on a peer turn too"
+                        (is (denied? r13 "not in :web :allow"))
+                        (is (denied? r14 "not in :web :allow")))
+                      (testing "every URL is in the audit log, refusals with their reason"
+                        (let [recs (filter #(= "web_extract" (get % "tool"))
+                                           (map h/json-parse (str/split-lines (h/slurp (h/join (p2p/itonami-dir) "logs" "terminal-sandbox.jsonl")))))]
+                          (is (some #(and (get % "denied") (= "private-address" (get % "reason"))) recs))
+                          (is (some #(and (get % "denied") (= "scheme" (get % "reason"))) recs))
+                          (is (some #(and (not (get % "denied")) (= 200 (get % "status"))) recs)))))
+                    (p/catch (fn [e] (is (nil? e) (str "web test crashed: " (.-message e)))))
+                    (p/finally (fn [_ _] (finish))))))))))))

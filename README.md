@@ -113,6 +113,21 @@ nothing under the home directory except its own roots, the bundle it runs
 from and the toolchains on `PATH`; its commands get the per-run `TMPDIR` as
 `HOME`.
 
+`web_extract` goes through `itonami.agent.webguard`: http(s) only, no
+credentials in the URL, and every address the host resolves to must be
+public -- loopback, private, link-local (cloud metadata), CGNAT (tailscale),
+multicast and reserved ranges are refused, judged inside the socket's own
+lookup so a DNS answer cannot change between check and connect. Redirects
+are followed by hand (at most 5), each hop judged again; bodies are cut at
+2 MB. To limit where a profile may fetch from at all:
+
+```clojure
+:web {:allow ["www.mhlw.go.jp" "*.go.jp"]}   ; exact names or *.suffix
+```
+
+A bundle can only narrow this, so a peer turn honours it. Every URL, fetched
+or refused, is a line in `~/.itonami/logs/terminal-sandbox.jsonl`.
+
 ### Decentralised inference (no third-party relay)
 
 Every node brings its own inference rails and lends them to trusted peers.

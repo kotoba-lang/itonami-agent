@@ -59,6 +59,9 @@
      :write-extra (vec (when-not peer? (map h/expand (:write t))))
      ;; :all-but-secrets | :roots (home-dir reads limited to the run's roots)
      :read-scope (if peer? :roots :all-but-secrets)
+     ;; web_extract host allowlist; nil = any public host. It only narrows,
+     ;; so a peer turn honours the bundle's
+     :web-allow (some-> (get-in itonami-edn [:web :allow]) vec)
      :peer? (boolean peer?)}))
 
 (defn- under? [p dir] (or (= p dir) (str/starts-with? p (str dir "/"))))
@@ -226,3 +229,12 @@
   [{:keys [tool profile peer? path reason]}]
   (audit-line! {"tool" tool "profile" profile "peer" (boolean peer?)
                 "denied" true "reason" (name reason) "path" (clip200 path)}))
+
+(defn audit-web!
+  "One line per web_extract URL: fetched or refused, and why."
+  [{:keys [profile peer? url denied reason status redirects]}]
+  (audit-line! {"tool" "web_extract" "profile" profile "peer" (boolean peer?)
+                "denied" (boolean denied) "reason" (some-> reason name)
+                "status" status "redirects" redirects
+                "host" (try (.-host (js/URL. url)) (catch :default _ nil))
+                "url" (clip200 url)}))

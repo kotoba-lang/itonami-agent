@@ -1,0 +1,178 @@
+(ns itonami.agent.webguard
+  "The network boundary of `web_extract`. A URL an LLM chose is fetched only
+  if it leads to the public internet:
+
+    scheme     http / https only; no user:pass@ in the URL
+    address    every address the host resolves to must be public -- not
+               loopback, private, link-local (cloud metadata), CGNAT
+               (tailscale), multicast or reserved. Checked inside the
+               socket's own `lookup`, so the address judged is the address
+               connected to (no DNS-rebinding window); IP-literal hosts,
+               which never reach `lookup`, are judged before connecting
+    redirects  followed by hand, at most 5, each hop judged again
+    size/time  body cut at 2 MB, 20 s per hop
+    allowlist  itonami.edn `:web {:allow [\"example.org\" \"*.go.jp\"]}`
+               narrows the hosts further (a bundle may only narrow, so a
+               peer turn honours it)
+
+  A refusal rejects with ex-data {:denied reason}."
+  (:require [clojure.string :as str]
+            [promesa.core :as p]
+            ["node:dns" :as dns]
+            ["node:net" :as net]
+            ["node:http" :as http]
+            ["node:https" :as https]))
+
+(def user-agent "Mozilla/5.0 (compatible; itonami-agent/0.1; +https://itonami.cloud)")
+(def max-bytes (* 2 1024 1024))
+(def max-redirects 5)
+(def timeout-ms 20000)
+
+;; ---------------------------------------------------------------- addresses
+
+(defn- v4-octets [s] (mapv js/parseInt (str/split s #"\.")))
+
+(defn- v4-blocked? [s]
+  (let [[a b c] (v4-octets s)]
+    (or (= a 0) (= a 10) (= a 127)
+        (and (= a 100) (<= 64 b 127))                ; CGNAT, tailscale
+        (and (= a 169) (= b 254))                    ; link-local, cloud metadata
+        (and (= a 172) (<= 16 b 31))
+        (and (= a 192) (= b 0) (#{0 2} c))
+        (and (= a 192) (= b 168))
+        (and (= a 198) (#{18 19} b))
+        (and (= a 198) (= b 51) (= c 100))
+        (and (= a 203) (= b 0) (= c 113))
+        (>= a 224))))                                 ; multicast, reserved, broadcast
+
+(defn- v6-groups
+  "An IPv6 address as 8 integers (handles :: and a trailing dotted v4)."
+  [s]
+  (let [s (str/lower-case (str/replace s #"^\[|\]$" ""))
+        s (str/replace s #"%.*$" "")
+        [s tail4] (if-let [[_ head v4] (re-matches #"(.*:)(\d+\.\d+\.\d+\.\d+)" s)]
+                    (let [[a b c d] (v4-octets v4)]
+                      [(str head (.toString (+ (* a 256) b) 16) ":" (.toString (+ (* c 256) d) 16)) true])
+                    [s false])
+        parse (fn [part] (if (str/blank? part) [] (mapv #(js/parseInt % 16) (str/split part #":"))))
+        [l r] (if (str/includes? s "::") (str/split s #"::" 2) [s nil])
+        lg (parse l) rg (parse r)]
+    (vec (concat lg (repeat (- 8 (count lg) (count rg)) 0) rg))))
+
+(defn- groups->v4 [g1 g2]
+  (str (bit-shift-right g1 8) "." (bit-and g1 255) "." (bit-shift-right g2 8) "." (bit-and g2 255)))
+
+(defn- v6-blocked? [s]
+  (let [[a b c d e f g h :as gs] (v6-groups s)]
+    (or (every? zero? gs)                                         ; ::
+        (= gs [0 0 0 0 0 0 0 1])                                  ; ::1
+        (and (every? zero? [a b c d e]) (= f 0xffff) (v4-blocked? (groups->v4 g h)))  ; v4-mapped
+        (and (every? zero? [a b c d e f]) (v4-blocked? (groups->v4 g h)))             ; v4-compatible
+        (and (= a 0x64) (= b 0xff9b) (v4-blocked? (groups->v4 g h)))                  ; NAT64
+        (= 0xfc00 (bit-and a 0xfe00))                             ; unique local
+        (= 0xfe80 (bit-and a 0xffc0))                             ; link-local
+        (= 0xff00 (bit-and a 0xff00))                             ; multicast
+        (and (= a 0x2001) (= b 0x0db8)))))                        ; documentation
+
+(defn blocked-address?
+  "True for any address a fetch must not connect to."
+  [addr]
+  (case (net/isIP (str/replace (str addr) #"^\[|\]$" ""))
+    4 (v4-blocked? addr)
+    6 (v6-blocked? addr)
+    true))
+
+;; ---------------------------------------------------------------- hosts
+
+(defn host-allowed?
+  "`allow` nil = any public host; else exact names or *.suffix patterns."
+  [allow host]
+  (or (nil? allow)
+      (let [host (str/lower-case host)]
+        (boolean (some (fn [pat]
+                         (let [pat (str/lower-case pat)]
+                           (if (str/starts-with? pat "*.")
+                             (str/ends-with? host (subs pat 1))
+                             (= host pat))))
+                       allow)))))
+
+(defn- deny [reason msg] (ex-info msg {:denied reason}))
+
+(defn- guarded-lookup
+  "net/tls `lookup` that resolves, then refuses when any address is not
+  public. `public-override` (tests) is a set of addresses treated as public."
+  [public-override]
+  (fn [hostname opts cb]
+    (dns/lookup hostname #js {:all true :family (or (.-family opts) 0)}
+                (fn [err addrs]
+                  (if err
+                    (cb err)
+                    (let [as (js->clj addrs :keywordize-keys true)
+                          bad (remove #(contains? public-override (:address %))
+                                      (filter #(blocked-address? (:address %)) as))]
+                      (if (seq bad)
+                        (cb (doto (js/Error. (str "web: " hostname " resolves to a non-public address " (:address (first bad))))
+                              (aset "denied" "private-address")))
+                        (if (.-all opts)
+                          (cb nil (clj->js as))
+                          (cb nil (:address (first as)) (:family (first as)))))))))))
+
+(defn- check-url
+  "nil when `u` may be requested, else the refusal."
+  [^js u allow public-override]
+  (let [host (str/replace (.-hostname u) #"^\[|\]$" "")]
+    (cond
+      (not (#{"http:" "https:"} (.-protocol u))) (deny :scheme (str "web: scheme not allowed: " (.-protocol u)))
+      (or (seq (.-username u)) (seq (.-password u))) (deny :credentials "web: credentials in the URL are not allowed")
+      (not (host-allowed? allow host)) (deny :not-allowlisted (str "web: host not in :web :allow: " host))
+      (and (pos? (net/isIP host)) (blocked-address? host) (not (contains? public-override host)))
+      (deny :private-address (str "web: non-public address " host)))))
+
+(defn- get-once
+  "One GET, no redirect following. Resolves {:status :location :text}."
+  [^js u public-override]
+  (p/create
+   (fn [resolve reject]
+     (let [mod (if (= "https:" (.-protocol u)) https http)
+           req (.request mod u #js {:method "GET"
+                                    :headers #js {"User-Agent" user-agent "Accept" "text/html,text/plain,application/json;q=0.9,*/*;q=0.5"}
+                                    :lookup (guarded-lookup public-override)
+                                    :timeout timeout-ms})]
+       (.on req "timeout" (fn [] (.destroy req (js/Error. "web: timeout"))))
+       (.on req "error" (fn [^js e]
+                          (reject (if-let [d (.-denied e)] (deny (keyword d) (.-message e)) e))))
+       (.on req "response"
+            (fn [^js res]
+              (let [status (.-statusCode res)
+                    location (aget (.-headers res) "location")]
+                (if (and (<= 300 status 399) location)
+                  (do (.resume res) (resolve {:status status :location location}))
+                  (let [chunks #js [] n (atom 0)]
+                    (.on res "data" (fn [c]
+                                      (when (<= @n max-bytes) (.push chunks c))
+                                      (swap! n + (.-length c))
+                                      (when (> @n max-bytes) (.destroy res))))
+                    (let [done (fn [] (resolve {:status status
+                                                :truncated? (> @n max-bytes)
+                                                :text (.toString (js/Buffer.concat chunks) "utf8")}))]
+                      (.on res "end" done)
+                      (.on res "close" done)))))))
+       (.end req)))))
+
+(defn fetch-text
+  "GET `url` within the boundary. Resolves {:status :text :url final-url
+  :redirects n :truncated? bool}; rejects with ex-data {:denied reason} on a
+  refusal. opts: :allow (host allowlist), :public-override (tests)."
+  [url {:keys [allow public-override] :or {public-override #{}}}]
+  (p/loop [url url hops 0]
+    (let [u (try (js/URL. url) (catch :default _ nil))]
+      (cond
+        (nil? u) (p/rejected (deny :bad-url (str "web: not a URL: " url)))
+        (> hops max-redirects) (p/rejected (deny :too-many-redirects "web: too many redirects"))
+        :else
+        (if-let [refusal (check-url u allow public-override)]
+          (p/rejected refusal)
+          (p/let [r (get-once u public-override)]
+            (if-let [loc (:location r)]
+              (p/recur (str (js/URL. loc u)) (inc hops))
+              (assoc r :url url :redirects hops))))))))
