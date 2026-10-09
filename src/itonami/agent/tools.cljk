@@ -84,6 +84,15 @@
   [sets]
   (vec (distinct (mapcat #(get toolsets % []) sets))))
 
+(defn enabled-tool-names
+  "Requested toolsets minus the profile's `agent.disabled_toolsets` (Hermes
+  config.yaml; Hermes subtracts them last, after every enable, and so do
+  we). A toolset itonami-agent does not implement (browser, x_search) names
+  no tools here and subtracts nothing."
+  [requested disabled]
+  (let [off (set (tool-names disabled))]
+    (vec (remove off (tool-names requested)))))
+
 (defn tool-schemas [names] (vec (keep schemas names)))
 
 ;; ---------------------------------------------------------------- helpers

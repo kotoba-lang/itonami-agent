@@ -79,7 +79,11 @@ Use tools to act; do not describe a tool call instead of making it. Independent 
         budget-ms (* 1000 (or budget-s (get-in config ["agent" "run_budget_seconds"]) 0))
         hops (provider/decentralize (provider/chain config {:model model :provider provider :pinned? pinned?})
                                     (:itonami prof) config)
-        names (tools/tool-names (or toolsets ["hermes-cli"]))
+        ;; agent.disabled_toolsets travels in the bundle (not host-local), so a
+        ;; peer turn drops the same tools; a -t / peer opts toolsets cannot re-add them
+        names (tools/enabled-tool-names (or toolsets ["hermes-cli"])
+                                        (let [d (get-in config ["agent" "disabled_toolsets"])]
+                                          (if (string? d) [d] d)))
         schemas (tools/tool-schemas names)
         writes (atom [])
         cwd (or cwd (some-> (get-in config ["terminal" "cwd"]) h/expand) (h/join (:home prof) "workspace"))

@@ -482,3 +482,17 @@ plain: true
                       (is (some #(and (not (get % "denied")) (= 200 (get % "status"))) recs)))))
                 (p/catch (fn [e] (is (nil? e) (str "search test crashed: " (.-message e)))))
                 (p/finally (fn [_ _] (.close engine) (h/rm base) (done))))))))))
+
+(deftest disabled-toolsets
+  (testing "agent.disabled_toolsets is subtracted after every enable, as in Hermes"
+    (is (= ["terminal" "read_file" "write_file" "patch" "search_files" "skill_view" "memory"]
+           (tools/enabled-tool-names ["hermes-cli"] ["web" "search" "browser" "x_search"])))
+    (is (= [] (tools/enabled-tool-names ["web"] ["web"])) "an explicit -t web cannot re-add it")
+    (is (= ["web_extract"] (tools/enabled-tool-names ["web"] ["search"])) "search removes web_search only")
+    (is (= (tools/tool-names ["hermes-cli"]) (tools/enabled-tool-names ["hermes-cli"] nil))))
+  (testing "a disabled tool cannot be called even if the model names it"
+    (let [names (tools/enabled-tool-names ["hermes-cli"] ["web"])]
+      (async done
+        (-> (tools/call {} names "web_search" "{\"query\":\"x\"}")
+            (p/then (fn [r] (is (str/includes? r "not available in this run"))))
+            (p/finally (fn [_ _] (done))))))))
