@@ -126,7 +126,15 @@ are followed by hand (at most 5), each hop judged again; bodies are cut at
 ```
 
 A bundle can only narrow this, so a peer turn honours it. Every URL, fetched
-or refused, is a line in `~/.itonami/logs/terminal-sandbox.jsonl`.
+or refused, is a line in `~/.itonami/logs/terminal-sandbox.jsonl`, with its
+query string reduced to a length.
+
+`web_search` uses the same fetch (so a profile with `:web :allow` must list
+`html.duckduckgo.com` to search) and checks the query before it leaves the
+host: queries over 256 chars, or carrying API keys / private keys / JWTs,
+40+ char encoded blobs, e-mail addresses or phone numbers are refused. These
+are pattern checks, not a guarantee. The audit line keeps the query's length
+and a sha256 prefix, never its text.
 
 ### Decentralised inference (no third-party relay)
 

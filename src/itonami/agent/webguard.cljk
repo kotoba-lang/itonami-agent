@@ -15,7 +15,11 @@
                narrows the hosts further (a bundle may only narrow, so a
                peer turn honours it)
 
-  A refusal rejects with ex-data {:denied reason}."
+  A refusal rejects with ex-data {:denied reason}.
+
+  `web_search` rides the same fetch, and its query is checked first
+  (query-refusal): a search query leaves the host for a third party, so it
+  must not carry secrets or personal data."
   (:require [clojure.string :as str]
             [promesa.core :as p]
             ["node:dns" :as dns]
@@ -176,3 +180,24 @@
             (if-let [loc (:location r)]
               (p/recur (str (js/URL. loc u)) (inc hops))
               (assoc r :url url :redirects hops))))))))
+
+;; ---------------------------------------------------------------- search queries
+
+(def max-query-chars 256)
+
+(def ^:private query-rules
+  ;; [reason regex] -- heuristics: they catch the shapes a secret or a
+  ;; person's contact details take, not every way to encode data
+  [[:secret #"-----BEGIN [A-Z ]*PRIVATE KEY|\b(sk|pk|rk)-[A-Za-z0-9_-]{16,}|\bgh[pousr]_[A-Za-z0-9]{20,}|\bAKIA[0-9A-Z]{16}\b|\bxox[abpr]-[A-Za-z0-9-]{10,}|\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}"]
+   [:encoded-blob #"[A-Za-z0-9+/=_-]{40,}"]
+   [:email #"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"]
+   [:phone #"(?:\+?\d[\d\s()-]{8,}\d)"]])
+
+(defn query-refusal
+  "nil when `q` may be sent to a search engine, else the reason keyword."
+  [q]
+  (let [q (str q)]
+    (cond
+      (str/blank? q) :empty-query
+      (> (count q) max-query-chars) :query-too-long
+      :else (some (fn [[reason re]] (when (re-find re q) reason)) query-rules))))

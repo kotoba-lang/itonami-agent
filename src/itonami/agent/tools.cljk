@@ -226,11 +226,6 @@
       (str/replace #"&gt;" ">") (str/replace #"&quot;" "\"") (str/replace #"&#39;" "'")
       (str/replace #"[ \t]+" " ") (str/replace #"\n\s*\n+" "\n\n") str/trim))
 
-(defn- fetch-text [url]
-  (-> (js/fetch url #js {:headers #js {"User-Agent" "Mozilla/5.0 (compatible; itonami-agent/0.1; +https://itonami.cloud)"}
-                         :redirect "follow"})
-      (p/then (fn [^js r] (p/let [t (.text r)] {:status (.-status r) :text t})))))
-
 (defn web-extract
   "Fetch up to 5 URLs through itonami.agent.webguard: public addresses only
   (no loopback / LAN / tailscale / cloud metadata, judged at connect time),
@@ -252,17 +247,37 @@
                                           {"url" u "error" (.-message e)}))))))]
       (ok {"results" (vec res)}))))
 
-(defn web-search [_ctx {:strs [query limit]}]
-  ;; keyless HTML endpoint; Hermes' paid search backends are not assumed
-  (-> (fetch-text (str "https://html.duckduckgo.com/html/?q=" (js/encodeURIComponent query)))
-      (p/then (fn [{:keys [text]}]
-                (let [hits (->> (re-seq #"(?s)class=\"result__a\" href=\"([^\"]+)\"[^>]*>(.*?)</a>.*?class=\"result__snippet\"[^>]*>(.*?)</a>" text)
-                                (map (fn [[_ href title snip]]
-                                       (let [u (or (some-> (re-find #"uddg=([^&]+)" href) second js/decodeURIComponent) href)]
-                                         {"url" u "title" (strip-html title) "description" (strip-html snip)})))
-                                (take (or limit 8)))]
-                  (ok {"results" (vec hits)}))))
-      (p/catch (fn [e] (err (str "web_search: " (.-message e)))))))
+(def search-endpoint "https://html.duckduckgo.com/html/?q=")
+
+(defn web-search
+  "Keyless DuckDuckGo HTML search through itonami.agent.webguard (public
+  address, 2 MB cap, the profile's :web :allow -- a profile with an
+  allowlist must list html.duckduckgo.com to search). The query is checked
+  before it leaves the host: no secrets, encoded blobs, e-mail addresses or
+  phone numbers, at most 256 chars. The audit log keeps its length and
+  hash, never its text."
+  [ctx {:strs [query limit]}]
+  (let [pol (policy ctx)
+        q (str query)
+        audit (fn [m] (confine/audit-web! (merge {:tool "web_search" :profile (:profile ctx) :peer? (:peer? pol) :query q} m)))]
+    (if-let [why (webguard/query-refusal q)]
+      (do (audit {:denied true :reason why})
+          (p/resolved (err (str "web_search refused: query looks like it carries " (name why)
+                                " -- search with general words, not with secrets or a person's details"))))
+      (-> (webguard/fetch-text (str (:search-endpoint ctx search-endpoint) (js/encodeURIComponent q))
+                               {:allow (:web-allow pol) :public-override (:web-public-override ctx #{})})
+          (p/then (fn [{:keys [text status]}]
+                    (audit {:status status})
+                    (let [hits (->> (re-seq #"(?s)class=\"result__a\" href=\"([^\"]+)\"[^>]*>(.*?)</a>.*?class=\"result__snippet\"[^>]*>(.*?)</a>" text)
+                                    (map (fn [[_ href title snip]]
+                                           (let [u (or (some-> (re-find #"uddg=([^&]+)" href) second js/decodeURIComponent) href)]
+                                             {"url" u "title" (strip-html title) "description" (strip-html snip)})))
+                                    (take (or limit 8)))]
+                      (ok {"results" (vec hits)}))))
+          (p/catch (fn [e]
+                     (let [reason (:denied (ex-data e))]
+                       (audit {:denied (boolean reason) :reason (or reason :error)})
+                       (err (str "web_search: " (.-message e))))))))))
 
 (defn skill-view [ctx {:strs [name file_path]}]
   (let [skills (h/join (:home ctx) "skills")

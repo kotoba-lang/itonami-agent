@@ -417,3 +417,68 @@ plain: true
                           (is (some #(and (not (get % "denied")) (= 200 (get % "status"))) recs)))))
                     (p/catch (fn [e] (is (nil? e) (str "web test crashed: " (.-message e)))))
                     (p/finally (fn [_ _] (finish))))))))))))
+
+;; ---------------------------------------------------------------- web_search confinement
+
+(deftest search-query-shapes
+  (doseq [q ["厚生労働省 子ども 相談窓口" "やさしい日本語 学習 教材" "児童扶養手当 2026 改正"
+             "NPO 学習支援 無料 東京都" "ISO 27001 Annex A 8.2"]]
+    (is (nil? (webguard/query-refusal q)) q))
+  (doseq [[q why] [["" :empty-query]
+                   [(apply str (repeat 300 "a")) :query-too-long]
+                   ["sk-proj-abcdefghijklmnopqrstuvwx" :secret]
+                   ["token ghp_0123456789abcdefghijABCDEFGHIJ" :secret]
+                   ["AKIAIOSFODNN7EXAMPLE" :secret]
+                   ["-----BEGIN OPENSSH PRIVATE KEY-----" :secret]
+                   ["eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0" :secret]
+                   ["REJfUEFTU1dPUkQ9aHVudGVyMiBBUElfS0VZPXNrLWRlY295" :encoded-blob]
+                   ["相談者 taro.yamada@example.jp の件" :email]
+                   ["電話 090-1234-5678 の相談" :phone]
+                   ["+81 3 1234 5678" :phone]]]
+    (is (= why (webguard/query-refusal q)) q)))
+
+(deftest web-search-red-team
+  (async done
+    (let [http (js/require "node:http")
+          hits (atom 0)
+          serp (str "<div><a class=\"result__a\" href=\"//duckduckgo.com/l/?uddg=https%3A%2F%2Fwww.mhlw.go.jp%2F&rut=x\">厚生労働省</a>"
+                    "<a class=\"result__snippet\" href=\"x\">相談窓口の案内</a></div>")
+          engine (.createServer http (fn [^js req ^js res] (swap! hits inc) (.end res serp)))
+          base (h/mkdirs (h/join (p2p/itonami-dir) "test-search"))
+          log (h/join (p2p/itonami-dir) "logs" "terminal-sandbox.jsonl")]
+      (.listen engine 0 "127.0.0.1"
+        (fn []
+          (let [port (.-port (.address engine))
+                ctx {:cwd base :home base :profile "search-test" :terminal-policy (confine/policy nil {})
+                     :web-public-override #{"127.0.0.1"}
+                     :search-endpoint (str "http://127.0.0.1:" port "/html/?q=")}
+                search (fn [c q] (p/let [r (tools/web-search c {"query" q})] (h/json-parse r)))
+                leak "taro.yamada@example.jp"]
+            (-> (p/let [ok1 (search ctx "厚生労働省 子ども 相談窓口")
+                        n-after-ok @hits
+                        bad1 (search ctx (str "相談者 " leak " の件"))
+                        bad2 (search ctx "sk-proj-abcdefghijklmnopqrstuvwx")
+                        n-after-bad @hits
+                        al1 (search (assoc ctx :terminal-policy (confine/policy {:web {:allow ["*.go.jp"]}} {})) "厚生労働省")
+                        al2 (search (assoc ctx :terminal-policy (confine/policy {:web {:allow ["127.0.0.1"]}} {:peer? true})) "厚生労働省")
+                        _ (tools/web-extract ctx {"urls" [(str "http://127.0.0.1:" port "/html/?token=SECRET-IN-URL-DECOY")]})]
+                  (testing "control: an ordinary query is searched and parsed"
+                    (is (= 1 n-after-ok))
+                    (is (= "https://www.mhlw.go.jp/" (get-in ok1 ["results" 0 "url"]))))
+                  (testing "a query carrying personal data or a secret never leaves the host"
+                    (is (str/includes? (str (get bad1 "error")) "email"))
+                    (is (str/includes? (str (get bad2 "error")) "secret"))
+                    (is (= n-after-ok n-after-bad) "the engine saw no request"))
+                  (testing ":web :allow applies to search: unlisted engine refused, listed one used (peer turn too)"
+                    (is (str/includes? (str (get al1 "error")) "not in :web :allow"))
+                    (is (= "https://www.mhlw.go.jp/" (get-in al2 ["results" 0 "url"]))))
+                  (testing "the audit log keeps hashes and lengths, never the query or URL query text"
+                    (let [raw (h/slurp log)
+                          recs (filter #(= "web_search" (get % "tool")) (map h/json-parse (str/split-lines raw)))]
+                      (is (not (str/includes? raw leak)))
+                      (is (not (str/includes? raw "sk-proj-abcdefghij")))
+                      (is (not (str/includes? raw "SECRET-IN-URL-DECOY")))
+                      (is (some #(and (get % "denied") (= "email" (get % "reason")) (= 16 (count (get % "query_sha256")))) recs))
+                      (is (some #(and (not (get % "denied")) (= 200 (get % "status"))) recs)))))
+                (p/catch (fn [e] (is (nil? e) (str "search test crashed: " (.-message e)))))
+                (p/finally (fn [_ _] (.close engine) (h/rm base) (done))))))))))

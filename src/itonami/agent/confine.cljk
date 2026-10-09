@@ -230,11 +230,21 @@
   (audit-line! {"tool" tool "profile" profile "peer" (boolean peer?)
                 "denied" true "reason" (name reason) "path" (clip200 path)}))
 
+(defn- redact-url [url]
+  (try (let [u (js/URL. url)]
+         (str (.-origin u) (.-pathname u)
+              (when (seq (.-search u)) (str "?<" (dec (count (.-search u))) " chars>"))))
+       (catch :default _ "<not a URL>")))
+
 (defn audit-web!
-  "One line per web_extract URL: fetched or refused, and why."
-  [{:keys [profile peer? url denied reason status redirects]}]
-  (audit-line! {"tool" "web_extract" "profile" profile "peer" (boolean peer?)
-                "denied" (boolean denied) "reason" (some-> reason name)
-                "status" status "redirects" redirects
-                "host" (try (.-host (js/URL. url)) (catch :default _ nil))
-                "url" (clip200 url)}))
+  "One line per web_extract URL or web_search query: fetched or refused, and
+  why. Neither the URL's query string nor the search text is kept -- only
+  their length and a hash -- since either may hold what a person typed."
+  [{:keys [tool profile peer? url query denied reason status redirects]}]
+  (audit-line! (cond-> {"tool" (or tool "web_extract") "profile" profile "peer" (boolean peer?)
+                        "denied" (boolean denied) "reason" (some-> reason name)
+                        "status" status "redirects" redirects}
+                 url (assoc "host" (try (.-host (js/URL. url)) (catch :default _ nil))
+                            "url" (clip200 (redact-url url)))
+                 query (assoc "query_chars" (count query)
+                              "query_sha256" (subs (h/sha256-hex query) 0 16)))))
