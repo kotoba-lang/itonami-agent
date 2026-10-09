@@ -33,10 +33,12 @@
   (let [j #(h/join home %)]
     {:dirs (cond-> [(j ".ssh") (j ".aws") (j ".gnupg") (j ".kube") (j ".docker")
                     (j ".config/gh") (j ".config/gcloud") (j ".azure") (j ".password-store")
-                    (j "Library/Keychains") (h/join (itonami-dir) "node")]
+                    (j "Library/Keychains") (j ".itonami/node") (h/join (itonami-dir) "node")]
              true vec)
      :files (vec (concat [(j ".netrc") (j ".git-credentials") (j ".npmrc") (j ".pypirc")
-                          (h/join (itonami-dir) "peer.env") (j ".hermes/.env")]
+                          ;; the default home of the node key and peer.env is
+                          ;; protected even when ITONAMI_DIR points elsewhere
+                          (j ".itonami/peer.env") (h/join (itonami-dir) "peer.env") (j ".hermes/.env")]
                          ;; bwrap cannot match by pattern: name each profile's .env
                          (for [p (h/ls (j ".hermes/profiles"))] (j (str ".hermes/profiles/" p "/.env")))))
      ;; any dotenv or secrets file anywhere: profile homes, workspaces, repos
