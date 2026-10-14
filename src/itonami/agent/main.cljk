@@ -4,7 +4,9 @@
   Hermes-compatible surface (same profile homes, same files):
     itonami-agent [-p P] -z PROMPT [-m MODEL] [--provider P] [-t toolsets]
     itonami-agent [-p P] chat
-    itonami-agent [-p P] cron list | create <schedule> [prompt] [--name n --script s --deliver d]
+    itonami-agent bridge < request.json   one JSON request in; JSONL events/result out
+    itonami-agent [-p P] cron list | create <schedule> [prompt] [--name n --script s --no-agent]
+                              [--monitor-script s --monitor-url u --deliver d]
                               | run <id> | tick [--force] | runs [--limit n] | status
     itonami-agent profile list | show <p>
 
@@ -13,6 +15,7 @@
     itonami-agent profile adopt <p>                         itonami ticks this profile's cron; Hermes stops
     itonami-agent profile release <p>                       hand cron back to Hermes
     itonami-agent profile bundle <p>                        print the bundle CID and file list
+    itonami-agent profile refresh-bundle <p>                recompute CID after profile files change
     itonami-agent gateway run [--interval 60]               tick every adopted profile (resident)
     itonami-agent peer id | serve [--port 7420 --url U --max-runs 2]
                        | add <url> [--did D --trust] | trust <did> | list
@@ -27,11 +30,13 @@
             [itonami.agent.host :as h]
             [itonami.agent.profile :as profile]
             [itonami.agent.loop :as agent-loop]
+            [itonami.agent.tools :as tools]
             [itonami.agent.cron :as cron]
             [itonami.agent.p2p :as p2p]
             [itonami.agent.rails :as rails]
             [itonami.agent.provider :as provider]
-            ["node:readline" :as readline]))
+            ["node:readline" :as readline]
+            ["node:crypto" :as crypto]))
 
 (defn- parse-args
   "Hermes-style: -p/--profile anywhere, flags with values, the rest positional."
@@ -61,16 +66,105 @@
     (println (str "[itonami-agent] " (name (:event e)) " "
                   (pr-str (dissoc e :event :content))))))
 
-(defn- run-opts [opts]
+(defn- run-opts [opts prof]
   (cond-> {:model (:model opts) :provider (:provider opts) :pinned? (boolean (:model opts))
-           :toolsets (:toolsets opts) :platform "cli" :load-context? true :cwd (js/process.cwd)}
+           :toolsets (:toolsets opts) :platform "cli" :load-context? true :cwd (js/process.cwd)
+           :tool-overrides {"cronjob_manage" (fn [_ args] (cron/manage prof args))}}
     (:verbose opts) (assoc :on-event log-event)))
+
+(defn bridge
+  "JSONL local-host protocol. First line is the request; later approval lines
+  resolve tool calls before execution. Unsupported tools fail closed."
+  []
+  (let [rl (readline/createInterface #js {:input js/process.stdin :crlfDelay js/Infinity})
+        started? (atom false)
+        pending (atom {})]
+    (defn send-row [row] (println (h/json-str row)))
+    (defn start-request [request]
+      (let [profile-name (or (get request "profile") "default")
+            prompt (get request "prompt")
+            requested-tools (get request "tool_names")
+            unsupported (tools/unsupported-tools requested-tools)]
+        (when-not (string? prompt)
+          (throw (ex-info "bridge request requires a string prompt" {})))
+        (when-not (vector? requested-tools)
+          (throw (ex-info "bridge request requires an explicit tool_names array" {})))
+        (when (seq unsupported)
+          (throw (ex-info (str "Kotoba agent does not implement requested tools: "
+                               (str/join ", " unsupported))
+                          {:unsupported-tools unsupported})))
+        (let [prof (profile/load-profile profile-name)
+              ask-before-tool (fn [{:keys [name arguments]}]
+                                (let [request-id (.randomUUID crypto)]
+                                  (js/Promise.
+                                   (fn [resolve]
+                                     (swap! pending assoc request-id resolve)
+                                     (send-row {"type" "approval.request"
+                                                "request_id" request-id
+                                                "choices" ["once" "deny"]
+                                                "tool" name "arguments" arguments
+                                                "description" (str "Allow Kotoba agent to run " name "?")})))))
+              options {:model (get request "model")
+                       :provider (get request "provider")
+                       :pinned? (boolean (get request "model"))
+                       :tool-names requested-tools
+                       :history (get request "history")
+                       :instructions (get request "instructions")
+                       :cwd (or (get request "cwd") (js/process.cwd))
+                       :platform "api_server"
+                       :load-context? true
+                       :max-turns (get request "max_turns")
+                       :budget-s (get request "budget_s")
+                       :before-tool ask-before-tool
+                       :tool-overrides {"cronjob_manage" (fn [_ args] (cron/manage prof args))}
+                       :on-event (fn [event]
+                                   (send-row {"type" "event" "event" event}))}]
+          (-> (agent-loop/run prof prompt options)
+              (p/then (fn [result]
+                        (let [usage (:usage result)]
+                          (send-row
+                           {"type" "result"
+                            "result" {"final_response" (:final result)
+                                      "completed" (= "completed" (:exit-reason result))
+                                      "exit_reason" (:exit-reason result)
+                                      "error" (or (get-in result [:error :error])
+                                                  (when-not (= "completed" (:exit-reason result))
+                                                    (:exit-reason result)))
+                                      "usage" {"input_tokens" (or (get usage "prompt_tokens") 0)
+                                               "output_tokens" (or (get usage "completion_tokens") 0)
+                                               "total_tokens" (or (get usage "total_tokens") 0)}
+                                      "model" (:model result)
+                                      "provider" (:provider result)}})))
+              (p/catch (fn [e]
+                         (send-row {"type" "error" "error" (.-message e)})
+                         (set! (.-exitCode js/process) 1)))
+              (p/finally (fn [] (.close rl))))))))
+    (.on rl "line"
+         (fn [line]
+           (try
+             (let [message (h/json-parse line)]
+               (if-not @started?
+                 (do
+                   (reset! started? true)
+                   (start-request message))
+                 (let [request-id (get message "request_id")
+                       choice (get message "choice")
+                       resolve (get @pending request-id)]
+                   (when (and (= (get message "type") "approval")
+                              (contains? #{"once" "deny"} choice) resolve)
+                     (swap! pending dissoc request-id)
+                     (resolve (= choice "once"))))))
+             (catch :default e
+               (send-row {"type" "error" "error" (.-message e)})
+               (set! (.-exitCode js/process) 1)
+               (.close rl)))))
+    nil))
 
 ;; ---------------------------------------------------------------- -z / chat
 
 (defn oneshot [opts]
   (p/let [prof (profile/load-profile (:profile opts))
-          r ((executor opts) prof (:oneshot opts) (run-opts opts))]
+          r ((executor opts) prof (:oneshot opts) (run-opts opts prof))]
     (if (and (= "completed" (:exit-reason r)) (not (str/blank? (:final r))))
       (do (println (:final r))
           (when (:verbose opts)
@@ -93,7 +187,7 @@
                              (let [prompt (if @history
                                             (str "Conversation so far:\n" @history "\n\nUser: " line)
                                             line)]
-                               (-> ((executor opts) prof prompt (run-opts opts))
+                               (-> ((executor opts) prof prompt (run-opts opts prof))
                                    (p/then (fn [r]
                                              (println (or (:final r) (str "[" (:exit-reason r) "] " (get-in r [:error :error]))))
                                              (swap! history #(str % "\nUser: " line "\nAssistant: " (:final r)))
@@ -127,7 +221,14 @@
 
       ("create" "add")
       (let [[schedule prompt] args
+            no-agent (boolean (:no-agent opts))
+            _ (when (or (str/blank? (str schedule))
+                        (and no-agent (str/blank? (str (:script opts))))
+                        (and (not no-agent) (str/blank? (str prompt))))
+                (die 2 "create requires a schedule and either a prompt or --no-agent with --script"))
             j (cron/new-job {:schedule schedule :prompt prompt :name (:name opts) :script (:script opts)
+                             :monitor-script (:monitor-script opts) :monitor-url (:monitor-url opts)
+                             :no-agent no-agent
                              :deliver (:deliver opts) :model (:model opts) :provider (:provider opts)
                              :toolsets (:toolsets opts) :workdir (:workdir opts)})]
         (cron/write-jobs! home (conj (cron/read-jobs home) j))
@@ -213,6 +314,13 @@
           files (profile/bundle-files (:home prof) (select-keys (get-in prof [:itonami :bundle]) [:skills :dirs]))]
       (println (profile/bundle-cid files))
       (doseq [[path sha] (profile/bundle-manifest files)] (println (str "  " (subs sha 0 12) "  " path))))
+
+    "refresh-bundle"
+    (let [prof (profile/load-profile (first args) {:secrets? false})]
+      (when-not (:itonami prof)
+        (die 2 (str "profile " (:name prof) " is not itonamified; run profile itonamify first")))
+      (let [m (profile/refresh-bundle-cid (:home prof))]
+        (println (str "refreshed " (:name prof) " bundle " (get-in m [:bundle :cid])))))
 
     "adopt"
     (let [prof (profile/load-profile (first args) {:secrets? false})
@@ -325,6 +433,7 @@
             (and (:oneshot opts) (not= "peer" (first pos))) (oneshot opts)
             :else
             (case (first pos)
+              "bridge" (bridge)
               "chat" (chat opts)
               "cron" (cron-cmd opts (rest pos))
               "profile" (profile-cmd opts (rest pos))

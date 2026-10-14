@@ -28,9 +28,17 @@
 (defn exists? [p] (and p (fs/existsSync p)))
 (defn dir? [p] (and (exists? p) (.isDirectory (fs/statSync p))))
 (defn file? [p] (and (exists? p) (.isFile (fs/statSync p))))
+(defn symlink? [p] (and (exists? p) (.isSymbolicLink (fs/lstatSync p))))
 (defn slurp [p] (str (fs/readFileSync p "utf8")))
 (defn slurp-bytes [p] (fs/readFileSync p))
 (defn mkdirs [p] (fs/mkdirSync p #js {:recursive true}) p)
+(defn slurp-base64 [p] (.toString (fs/readFileSync p) "base64"))
+(defn file-mode [p] (bit-and (.-mode (fs/statSync p)) 511))
+(defn utf8-byte-length [s] (.byteLength js/Buffer s "utf8"))
+(defn spit-base64 [p s mode]
+  (mkdirs (dirname p))
+  (fs/writeFileSync p (.from js/Buffer s "base64") #js {:mode (or mode 420)})
+  p)
 (defn spit
   ([p s] (spit p s nil))
   ([p s {:keys [mode append?]}]
@@ -67,6 +75,21 @@
                             :else [r])))
                       (ls abs))))]
     (vec (sort (go "")))))
+
+(defn walk-symlinks
+  "Relative symbolic-link paths below dir. Unlike walk-files, reports links and never follows them."
+  [dir]
+  (letfn [(go [rel]
+            (let [abs (if (= rel "") dir (join dir rel))]
+              (mapcat (fn [n]
+                        (let [r (if (= rel "") n (str rel "/" n))
+                              a (join dir r)]
+                          (cond
+                            (.isSymbolicLink (fs/lstatSync a)) [r]
+                            (dir? a) (go r)
+                            :else [])))
+                      (ls abs))))]
+    (if (dir? dir) (vec (sort (go ""))) [])))
 
 ;; ---------------------------------------------------------------- time
 
@@ -173,10 +196,9 @@
 (defn pid-alive? [pid]
   (try (js/process.kill pid 0) true (catch :default _ false)))
 
-(defn with-lock
-  "Exclusive lock by O_EXCL lock file holding our pid. A lock whose pid is
-  gone is taken over. Returns (f) or ::busy."
-  [lock-path f]
+(defn acquire-lock!
+  "Acquire an O_EXCL lock file holding our pid; take over only a dead holder."
+  [lock-path]
   (mkdirs (dirname lock-path))
   (let [take! (fn [] (try (let [fd (fs/openSync lock-path "wx")]
                             (fs/writeSync fd (str (.-pid js/process)))
@@ -187,6 +209,16 @@
                    (when-not (and (pos? holder) (pid-alive? holder))
                      (rm lock-path)
                      (take!))))]
-    (if got?
-      (try (f) (finally (rm lock-path)))
-      ::busy)))
+    (boolean got?)))
+
+(defn release-lock! [lock-path]
+  (let [holder (js/parseInt (try (slurp lock-path) (catch :default _ "0")) 10)]
+    (when (= holder (.-pid js/process)) (rm lock-path))))
+
+(defn with-lock
+  "Exclusive lock by O_EXCL lock file holding our pid. A lock whose pid is
+  gone is taken over. Returns (f) or ::busy."
+  [lock-path f]
+  (if (acquire-lock! lock-path)
+    (try (f) (finally (release-lock! lock-path)))
+    ::busy))

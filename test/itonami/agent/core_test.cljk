@@ -4,6 +4,7 @@
             [itonami.agent.yaml :as yaml]
             [itonami.agent.host :as h]
             [itonami.agent.profile :as profile]
+            [itonami.agent.loop :as agent-loop]
             [itonami.agent.provider :as provider]
             [itonami.agent.cron :as cron]
             [itonami.agent.p2p :as p2p]
@@ -88,6 +89,47 @@ plain: true
     (is (= 1 (.getDay (cron/next-cron "0 9 * * mon" d))))
     (is (= {"kind" "interval" "minutes" 30 "display" "every 30m"} (cron/parse-schedule "30m")))
     (is (= "cron" (get (cron/parse-schedule "0 9 * * 1-5") "kind")))))
+
+(deftest cron-script-command-by-extension
+  (testing "Hy uses the selected Python and enters Hy's CLI with script-local imports"
+    (is (= ["/job/python" "-c" cron/hy-script-bootstrap "/tmp/profile/scripts/job.hy"]
+           (cron/script-command {:config {"cron" {"script_python" "/config/python"}}
+                                 :env {"HERMES_PYTHON" "/env/python"}}
+                                {"interpreter" "/job/python"}
+                                "/tmp/profile/scripts/job.hy")))
+    (is (= ["/config/python" "-c" cron/hy-script-bootstrap "/tmp/job.hy"]
+           (cron/script-command {:config {"cron" {"script_python" "/config/python"}} :env {}}
+                                {} "/tmp/job.hy")))
+    (is (= ["/env/python" "/tmp/job.py"]
+           (cron/script-command {:config {} :env {"HERMES_PYTHON" "/env/python"}}
+                                {} "/tmp/job.py"))))
+  (testing "non-Python runners remain extension-specific"
+    (is (= ["bash" "/tmp/job.sh"]
+           (cron/script-command {:config {} :env {}} {} "/tmp/job.sh")))
+    (is (= ["kbb" "--backend" "sci" "/tmp/job.cljk"]
+           (cron/script-command {:config {} :env {}} {} "/tmp/job.cljk")))
+    (is (= ["node" "/tmp/job.mjs"]
+           (cron/script-command {:config {} :env {}} {} "/tmp/job.mjs")))))
+
+(deftest agent-loop-desktop-turn-context
+  (testing "prior user/assistant turns are kept in order and tool/system rows are excluded"
+    (is (= [{"role" "user" "content" "first"}
+            {"role" "assistant" "content" "second"}
+            {"role" "user" "content" "part one\npart two"}]
+           (agent-loop/history-messages
+            [{"role" "system" "content" "system text"}
+             {"role" "user" "content" "first"}
+             {:role "assistant" :content "second"}
+             {"role" "tool" "content" "old tool result"}
+             {"role" "user" "content" [{"type" "text" "text" "part one"}
+                                         {"type" "image_url" "url" "ignored"}
+                                         {"type" "text" "text" "part two"}]}]))))
+  (testing "per-request instructions enter the generated system prompt"
+    (let [text (agent-loop/system-prompt {:soul "profile soul" :home "/tmp/profile"}
+                                         {:cwd "/tmp" :skills? false
+                                          :instructions "Answer in Japanese."})]
+      (is (str/includes? text "profile soul"))
+      (is (str/includes? text "# Session instructions\nAnswer in Japanese.")))))
 
 (deftest cron-prompt-wrapper-matches-hermes
   (is (str/starts-with? cron/cron-hint "[IMPORTANT: You are running as a scheduled cron job."))
@@ -496,3 +538,25 @@ plain: true
         (-> (tools/call {} names "web_search" "{\"query\":\"x\"}")
             (p/then (fn [r] (is (str/includes? r "not available in this run"))))
             (p/finally (fn [_ _] (done))))))))
+
+(deftest explicit-tool-name-resolution
+  (testing "API-server tool names can be passed without broadening them to another toolset"
+    (is (= ["terminal" "read_file" "web_search"]
+           (tools/enabled-tool-names ["terminal" "read_file" "web_search" "not-implemented"] nil)))
+    (is (= ["read_file"]
+           (tools/enabled-tool-names ["read_file" "write_file"] ["write_file"])))
+    (is (= ["not-implemented" "browser"]
+           (tools/unsupported-tools ["terminal" "not-implemented" "browser" "terminal"]))))
+  (testing "existing toolset expansion remains unchanged"
+    (is (= (tools/tool-names ["hermes-cli"])
+           (tools/enabled-tool-names ["hermes-cli"] nil)))))
+
+(deftest tool-approval-policy
+  (testing "read-only tools proceed directly while effectful tools require desktop approval"
+    (is (false? (tools/approval-required? "read_file")))
+    (is (false? (tools/approval-required? "search_files")))
+    (is (false? (tools/approval-required? "web_search")))
+    (is (false? (tools/approval-required? "skill_view")))
+    (is (true? (tools/approval-required? "terminal")))
+    (is (true? (tools/approval-required? "write_file")))
+    (is (true? (tools/approval-required? "memory")))))

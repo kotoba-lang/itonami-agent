@@ -2,7 +2,7 @@
   "The Hermes core tools, same names and argument shapes (tools/*.py), so a
   SOUL or skill written for Hermes calls them unchanged.
 
-  Toolsets mirror toolsets.py: terminal / file / web / skills / memory.
+  Toolsets mirror Hermes: terminal / file / web / skills / todo / cron / memory.
   Results are JSON strings, as Hermes returns them.
 
   `ctx` carries where a tool may act:
@@ -15,7 +15,11 @@
             [promesa.core :as p]
             [itonami.agent.host :as h]
             [itonami.agent.confine :as confine]
-            [itonami.agent.webguard :as webguard]))
+            [itonami.agent.webguard :as webguard]
+            [itonami.agent.process :as process]
+            [itonami.agent.homeassistant :as homeassistant]
+            [itonami.agent.yaml :as yaml]
+            ["node:sqlite" :as sqlite]))
 
 (defn- fn-schema [name desc props required]
   {"type" "function"
@@ -28,8 +32,17 @@
               {"command" {"type" "string" "description" "The command to execute"}
                "timeout" {"type" "integer" "description" "Seconds before the command is killed (default 180)"}
                "workdir" {"type" "string" "description" "Working directory (default: the profile's terminal cwd)"}
-               "background" {"type" "boolean" "description" "Not supported by itonami-agent; ignored"}}
+               "background" {"type" "boolean" "description" "Start a background process; use process_manage to poll, wait, read output, send stdin, or terminate it"}}
               ["command"])
+   "process_manage"
+   (fn-schema "process_manage" "Poll, wait on, read, or control a background terminal process started in this Kotoba agent runtime. Completed results are retained for up to 7 days, newest 64 per profile, while the agent runtime is alive."
+              {"action" {"type" "string" "enum" ["list" "poll" "log" "wait" "kill" "write" "submit" "close" "handoff"]}
+               "session_id" {"type" "string" "description" "Exact id or unique prefix returned by terminal(background=true). Required except for list."}
+               "data" {"type" "string" "description" "Text to write or submit to stdin."}
+               "timeout" {"type" "integer" "minimum" 1 "description" "Seconds to wait, capped at 1800."}
+               "offset" {"type" "integer" "description" "Zero-based log line offset; omitted reads the tail."}
+               "limit" {"type" "integer" "minimum" 1 "description" "Maximum log lines (capped at 2000)."}}
+              ["action"])
    "read_file"
    (fn-schema "read_file" "Read a text file with line numbers (LINE_NUM|CONTENT)."
               {"path" {"type" "string"} "offset" {"type" "integer" "description" "1-based first line"}
@@ -61,28 +74,210 @@
    (fn-schema "skill_view" "Read a skill's SKILL.md (or a file inside the skill)."
               {"name" {"type" "string"} "file_path" {"type" "string"}}
               ["name"])
+   "skills_list"
+   (fn-schema "skills_list" "List available profile skills with names, descriptions, and categories. Use skill_view(name) to load a skill."
+              {"category" {"type" "string" "description" "Optional category filter"}}
+              [])
+   "skill_manage"
+   (fn-schema "skill_manage" "Create, patch, or delete profile skills and supporting files. Up to 20 operations apply as one approved transaction; any failure rolls the touched skills back. Delete must be the only operation. Read first with skill_view."
+              {"operations" {"type" "array" "minItems" 1 "maxItems" 20
+                             "items" {"type" "object" "properties"
+                                      {"action" {"type" "string" "enum" ["create" "patch" "write_file" "remove_file" "delete"]}
+                                       "name" {"type" "string"}
+                                       "category" {"type" "string"}
+                                       "content" {"type" "string"}
+                                       "old_string" {"type" "string"}
+                                       "new_string" {"type" "string"}
+                                       "replace_all" {"type" "boolean"}
+                                       "file_path" {"type" "string"}
+                                       "file_content" {"type" "string"}}
+                                      "required" ["action" "name"]}}}
+              ["operations"])
+   "todo_list"
+   (fn-schema "todo_list" "Track a task list for multi-step work. Pass todos to replace or merge the list; omit todos to read it. Always returns the full list."
+              {"todos" {"type" "array" "items" {"type" "object" "properties"
+                                                    {"id" {"type" "string"}
+                                                     "content" {"type" "string"}
+                                                     "status" {"type" "string" "enum" ["pending" "in_progress" "completed" "cancelled"]}
+                                                     "parent" {"type" "string"}}
+                                                    "required" ["id" "content" "status"]}}
+               "merge" {"type" "boolean" "default" false
+                        "description" "Update existing items by id and append new ones instead of replacing the list."}}
+              [])
+   "delegate_task"
+   (fn-schema "delegate_task" "Run up to three independent Kotoba child tasks in parallel and return their summaries. Each task needs a goal and may include context. Children share this profile's tools except delegation, memory, and cron management."
+              {"tasks" {"type" "array" "minItems" 1 "maxItems" 3
+                        "items" {"type" "object" "properties"
+                                 {"goal" {"type" "string"} "context" {"type" "string"}}
+                                 "required" ["goal"]}}}
+              ["tasks"])
+   "cronjob_manage"
+   (fn-schema "cronjob_manage" "Manage this profile's scheduled Kotoba jobs, including monitor_script and monitor_url pre-run checks. List, create, update, pause, resume, remove, or run a job. Mutations require approval."
+              {"action" {"type" "string" "enum" ["create" "list" "update" "pause" "resume" "remove" "run"]}
+               "job_id" {"type" "string"}
+               "prompt" {"type" "string"}
+               "schedule" {"type" "string" "description" "Use a duration such as 30m or every 2 hours, a phrase such as every weekday at 9am, a 5-field cron expression, an ISO timestamp, or a one-shot such as in 30m."}
+               "name" {"type" "string"}
+               "repeat" {"type" "integer"} "deliver" {"type" "string"} "failure_deliver" {"type" "string"}
+               "script" {"type" "string"} "monitor_script" {"type" "string"} "monitor_url" {"type" "string"}
+               "context_from" {"type" "array" "items" {"type" "string"}}
+               "continuity" {"type" "boolean"} "enabled_toolsets" {"type" "array" "items" {"type" "string"}}
+               "workdir" {"type" "string"} "no_agent" {"type" "boolean"}
+               "paused" {"type" "boolean"} "paused_reason" {"type" "string"} "pinned" {"type" "boolean"}
+               "skills" {"type" "array" "items" {"type" "string"}} "skill" {"type" "string"}
+               "include_disabled" {"type" "boolean"}}
+              ["action"])
    "memory"
    (fn-schema "memory" "Add, replace or remove an entry in persistent memory (MEMORY.md / USER.md)."
               {"action" {"type" "string" "enum" ["add" "replace" "remove"]}
                "target" {"type" "string" "enum" ["memory" "user"]}
                "content" {"type" "string"} "old_text" {"type" "string"} "new_text" {"type" "string"}}
-              ["action"])})
+              ["action"])
+   "execute_code"
+   (fn-schema "execute_code" "Run one Python script through this profile's OS confinement. This Kotoba implementation is stateless and does not provide Hermes tool RPC inside the script; use the normal Kotoba tools for tool calls."
+              {"code" {"type" "string" "description" "Python source to execute on stdin."}
+               "timeout" {"type" "integer" "minimum" 1 "maximum" 300 "description" "Maximum runtime in seconds (default 300)."}}
+              ["code"])
+   "session_search"
+   (fn-schema "session_search" "Search and read this profile's local Hermes conversation history. Supports recent-session browsing, FTS discovery, reading the latest messages in a session, and scrolling around a message id. It is read-only and never searches another profile."
+              {"query" {"type" "string" "description" "Full-text search query; omit to browse recent sessions."}
+               "limit" {"type" "integer" "minimum" 1 "maximum" 20 "description" "Maximum sessions or matching messages (default 5)."}
+               "session_id" {"type" "string" "description" "Read one session from this profile's history."}
+               "around_message_id" {"type" "integer" "description" "Return a bounded window around this message id; requires session_id."}
+               "window" {"type" "integer" "minimum" 1 "maximum" 20 "description" "Messages on each side of the anchor (default 5)."}
+               "role_filter" {"type" "string" "enum" ["user,assistant" "user,assistant,tool" "user" "assistant" "tool"]}}
+              [])
+   "ha_list_entities"
+   (fn-schema "ha_list_entities" "List Home Assistant entities, optionally filtered by domain or area."
+              {"domain" {"type" "string"} "area" {"type" "string"}} [])
+   "ha_get_state"
+   (fn-schema "ha_get_state" "Get one Home Assistant entity state and attributes."
+              {"entity_id" {"type" "string"}} ["entity_id"])
+   "ha_list_services"
+   (fn-schema "ha_list_services" "List Home Assistant services, optionally filtered by domain."
+              {"domain" {"type" "string"}} [])
+   "ha_call_service"
+   (fn-schema "ha_call_service" "Call a Home Assistant service. Shell, scripting, add-on, and REST-command domains are blocked."
+              {"domain" {"type" "string"} "service" {"type" "string"}
+               "entity_id" {"type" "string"} "data" {"type" "string"}}
+              ["domain" "service"])})
+
+(def hermes-core-tools
+  ;; Source of truth: Hermes `toolsets.py::_HERMES_CORE_TOOLS`. Keep the full
+  ;; advertised surface here, including tools Kotoba has not implemented yet.
+  ;; `loop/run` checks this list and refuses an incomplete runtime instead of
+  ;; quietly presenting a smaller toolset under a Hermes-compatible name.
+  ["web_search" "web_extract" "terminal" "process_manage"
+   "read_file" "write_file" "patch" "search_files"
+   "vision_analyze" "image_generate" "skills_list" "skill_view" "skill_manage"
+   "browser_navigate" "browser_snapshot" "browser_click" "browser_type"
+   "browser_scroll" "browser_back" "browser_press" "browser_get_images"
+   "browser_vision" "browser_console" "browser_cdp" "browser_dialog"
+   "browser_vault_list" "browser_vault_unlock" "browser_vault_fill"
+   "browser_vault_save_login" "browser_vault_enter_code" "browser_exec"
+   "text_to_speech" "todo_list" "memory" "session_search" "clarify"
+   "execute_code" "delegate_task" "cronjob_manage"
+   "ha_list_entities" "ha_get_state" "ha_list_services" "ha_call_service"
+   "kanban_show" "kanban_list" "kanban_complete" "kanban_block"
+   "kanban_request_review" "kanban_request_changes" "kanban_heartbeat"
+   "kanban_comment" "kanban_create" "kanban_link" "kanban_unblock"
+   "kanban_attach" "kanban_attach_url" "kanban_attachments" "computer_use"
+   "manage_connections"])
+
+(def hermes-api-tools
+  (vec (remove #(or (#{"text_to_speech" "clarify" "computer_use"} %)
+                    (str/starts-with? % "kanban_"))
+                hermes-core-tools)))
+
+(def browser-tools
+  ["browser_navigate" "browser_snapshot" "browser_click" "browser_type"
+   "browser_scroll" "browser_back" "browser_press" "browser_get_images"
+   "browser_vision" "browser_console" "browser_cdp" "browser_dialog"
+   "browser_vault_list" "browser_vault_unlock" "browser_vault_fill"
+   "browser_vault_save_login" "browser_vault_enter_code" "browser_exec"])
 
 (def toolsets
-  {"terminal" ["terminal"]
-   "file" ["read_file" "write_file" "patch" "search_files"]
-   "web" ["web_search" "web_extract"]
-   "search" ["web_search"]
-   "skills" ["skill_view"]
-   "memory" ["memory"]
-   ;; the bundles Hermes names
-   "hermes-cli" ["terminal" "read_file" "write_file" "patch" "search_files" "web_search" "web_extract" "skill_view" "memory"]
-   "hermes-cron" ["terminal" "read_file" "write_file" "patch" "search_files" "skill_view"]})
+  (let [file-tools ["read_file" "write_file" "patch" "search_files"]
+        skill-tools ["skills_list" "skill_view" "skill_manage"]
+        web-tools ["web_search" "web_extract"]
+        channel-bundles ["hermes-telegram" "hermes-whatsapp" "hermes-slack"
+                         "hermes-signal" "hermes-bluebubbles"
+                         "hermes-homeassistant" "hermes-email" "hermes-sms"
+                         "hermes-mattermost" "hermes-matrix" "hermes-dingtalk"
+                         "hermes-wecom" "hermes-wecom-callback" "hermes-weixin" "hermes-qqbot"]]
+    (merge
+     {"terminal" ["terminal" "process_manage"]
+      "file" file-tools "files" file-tools "web" web-tools "search" ["web_search"]
+      "x_search" ["x_search"] "vision" ["vision_analyze"] "video" ["video_analyze"]
+      "image_gen" ["image_generate"] "video_gen" ["video_generate" "xai_video_edit" "xai_video_extend"]
+      "computer_use" ["computer_use"] "skills" skill-tools "browser" browser-tools
+      "cronjob" ["cronjob_manage"] "tts" ["text_to_speech"] "todo" ["todo_list"]
+      "memory" ["memory"] "session_search" ["session_search"] "connections" ["manage_connections"]
+      "bot_room" [] "context_engine" []
+      "project" ["desktop_project"] "desktop_ui" ["read_terminal" "close_terminal" "desktop_preview"
+                                                    "drive_preview" "annotate_preview" "read_window_below"
+                                                    "focus_pane" "react_to_message" "gui_tour" "show_tip"]
+      "setup" ["manage_catalog"] "clarify" ["clarify"] "code_execution" ["execute_code"]
+      "delegation" ["delegate_task"] "homeassistant" ["ha_list_entities" "ha_get_state" "ha_list_services" "ha_call_service"]
+      "kanban" (filter #(str/starts-with? % "kanban_") hermes-core-tools)
+      "debugging" ["terminal" "process_manage" "web_search" "web_extract" "read_file" "write_file" "patch" "search_files"]
+      "safe" ["web_search" "web_extract" "vision_analyze" "image_generate"]
+      "coding" (vec (remove #{"image_generate" "text_to_speech" "cronjob_manage" "computer_use"
+                              "ha_list_entities" "ha_get_state" "ha_list_services" "ha_call_service"}
+                            (remove #(str/starts-with? % "kanban_") hermes-core-tools)))
+      "hermes-api-server" hermes-api-tools
+      "hermes-cli" hermes-core-tools
+      "hermes-cron" hermes-core-tools
+      "hermes-acp" (vec (remove #{"clarify"} hermes-core-tools))
+      "hermes-discord" (into hermes-core-tools ["discord" "discord_admin"])
+      "hermes-feishu" (into hermes-core-tools ["feishu_doc_read" "feishu_drive_list_comments"
+                                                "feishu_drive_list_comment_replies" "feishu_drive_reply_comment"
+                                                "feishu_drive_add_comment"])
+      "hermes-yuanbao" (into hermes-core-tools ["yb_query_group_info" "yb_query_group_members"
+                                                 "yb_send_dm" "yb_search_sticker" "yb_send_sticker"])
+      "hermes-webhook" ["web_search" "web_extract" "vision_analyze" "clarify"]
+      "hermes-gateway" (into hermes-core-tools ["discord" "discord_admin" "feishu_doc_read"
+                                                 "feishu_drive_list_comments" "feishu_drive_list_comment_replies"
+                                                 "feishu_drive_reply_comment" "feishu_drive_add_comment"
+                                                 "yb_query_group_info" "yb_query_group_members" "yb_send_dm"
+                                                 "yb_search_sticker" "yb_send_sticker"])
+      "discord" ["discord"] "discord_admin" ["discord_admin"]
+      "yuanbao" ["yb_query_group_info" "yb_query_group_members" "yb_send_dm" "yb_search_sticker" "yb_send_sticker"]
+      "feishu_doc" ["feishu_doc_read"]
+      "feishu_drive" ["feishu_drive_list_comments" "feishu_drive_list_comment_replies"
+                      "feishu_drive_reply_comment" "feishu_drive_add_comment"]
+      "spotify" ["spotify_playback" "spotify_devices" "spotify_queue" "spotify_search"
+                 "spotify_playlists" "spotify_albums" "spotify_library"]
+      "no_mcp" []}
+     (zipmap channel-bundles (repeat hermes-core-tools)))))
 
 (defn tool-names
-  "Toolset names -> distinct tool names, unknown toolsets ignored."
+  "Resolve toolsets or direct tool names; run preflight rejects unknown toolsets."
   [sets]
-  (vec (distinct (mapcat #(get toolsets % []) sets))))
+  (vec (distinct (mapcat #(or (get toolsets %)
+                               (when (contains? schemas %) [%])
+                               []) sets))))
+
+(defn unsupported-tools
+  "Tool names this Kotoba agent cannot execute. Callers at compatibility
+  boundaries should fail closed instead of silently dropping these tools."
+  [names]
+  (vec (distinct (remove (set (keys schemas)) names))))
+
+(defn unsupported-toolsets
+  "Toolset names neither implemented by Kotoba nor in Hermes' current catalog."
+  [sets]
+  (vec (distinct (remove #(or (contains? toolsets %) (contains? schemas %)) sets))))
+
+(def approval-free-tools #{"read_file" "search_files" "web_search" "web_extract" "skills_list" "skill_view" "todo_list" "delegate_task"
+                           "ha_list_entities" "ha_get_state" "ha_list_services"})
+
+(defn approval-required?
+  ([name] (approval-required? name nil))
+  ([name args]
+   (if (= name "cronjob_manage")
+     (not= "list" (get args "action"))
+     (not (contains? approval-free-tools name)))))
 
 (defn enabled-tool-names
   "Requested toolsets minus the profile's `agent.disabled_toolsets` (Hermes
@@ -138,7 +333,7 @@
   "A shell command under the OS sandbox of ctx's :terminal-policy (see
   itonami.agent.confine): writes only inside the run's roots (or its cwd),
   no secret stores, no network unless granted, only the env it names."
-  [ctx {:strs [command timeout workdir]}]
+  [ctx {:strs [command timeout workdir background]}]
   (let [cwd (if workdir (resolve-path ctx workdir) (:cwd ctx))
         pol (policy ctx)]
     (if (and (:roots ctx) (not (writable? ctx cwd)))
@@ -151,16 +346,23 @@
                                     :backend (backend ctx)})]
         (if-let [why (:refused c)]
           (err (str "terminal refused: " why))
-          (let [r (try (h/run-process (:argv c) {:cwd cwd :exact-env? true :env (:env c)
-                                                 :timeout-ms (* 1000 (or timeout (:terminal-timeout-s ctx) 180))})
-                       (finally (when (:tmpdir c) (h/rm (:tmpdir c)))))]
-            (confine/audit! {:profile (:profile ctx) :peer? (:peer? pol) :sandbox (:sandbox c)
-                             :cmd (str command) :exit (:exit r) :stderr (:stderr r)
-                             :timed-out? (:timed-out? r)})
-            (ok {"output" (clip (str (:stdout r) (when-not (str/blank? (:stderr r)) (str "\n[stderr]\n" (:stderr r)))) 50000)
-                 "exit_code" (:exit r)
-                 "sandbox" (name (:sandbox c))
-                 "error" (when (:timed-out? r) "timeout")})))))))
+          (if background
+            (process/spawn! ctx {:argv (:argv c) :env (:env c) :cwd cwd :tmpdir (:tmpdir c)
+                                 :command (str command)
+                                 :on-exit (fn [exit stderr]
+                                            (confine/audit! {:profile (:profile ctx) :peer? (:peer? pol)
+                                                             :sandbox (:sandbox c) :cmd (str command)
+                                                             :exit exit :stderr stderr :timed-out? false}))})
+            (let [r (try (h/run-process (:argv c) {:cwd cwd :exact-env? true :env (:env c)
+                                                   :timeout-ms (* 1000 (or timeout (:terminal-timeout-s ctx) 180))})
+                         (finally (when (:tmpdir c) (h/rm (:tmpdir c)))))]
+              (confine/audit! {:profile (:profile ctx) :peer? (:peer? pol) :sandbox (:sandbox c)
+                               :cmd (str command) :exit (:exit r) :stderr (:stderr r)
+                               :timed-out? (:timed-out? r)})
+              (ok {"output" (clip (str (:stdout r) (when-not (str/blank? (:stderr r)) (str "\n[stderr]\n" (:stderr r)))) 50000)
+                   "exit_code" (:exit r)
+                   "sandbox" (name (:sandbox c))
+                   "error" (when (:timed-out? r) "timeout")}))))))))
 
 (defn read-file [ctx {:strs [path offset limit]}]
   (let [abs (resolve-path ctx path)]
@@ -288,14 +490,413 @@
                        (audit {:denied (boolean reason) :reason (or reason :error)})
                        (err (str "web_search: " (.-message e))))))))))
 
+(defn skills-list [ctx {:strs [category]}]
+  (let [skills-dir (h/join (:home ctx) "skills")
+        rels (if (h/dir? skills-dir)
+               (filter #(= "SKILL.md" (last (str/split % #"/")))
+                       (h/walk-files skills-dir (fn [rel] (some #(str/starts-with? % ".") (str/split rel #"/")))))
+               [])
+        skills (->> rels
+                    (keep (fn [rel]
+                            (let [f (h/join skills-dir rel)]
+                              (when (readable? ctx "skills_list" f)
+                                (try
+                                  (let [s (h/slurp f)
+                                        fm (second (re-find #"(?s)^---\s*\n(.*?)\n---(?:\n|$)" s))
+                                        parsed (when fm (yaml/parse fm))
+                                        meta (if (map? parsed) parsed {})
+                                        parts (str/split rel #"/")
+                                        nm (nth parts (- (count parts) 2) "")
+                                        desc (or (get meta "description") "")
+                                        cat (when (= 3 (count parts)) (first parts))]
+                                    ;; skill_view resolves only <name>/SKILL.md and <category>/<name>/SKILL.md.
+                                    (when (and (#{2 3} (count parts)) (seq (str nm))
+                                               (or (nil? category) (= category cat)))
+                                      (cond-> {"name" (str nm) "description" (str desc)}
+                                        cat (assoc "category" cat))))
+                                  (catch :default _ nil))))))
+                    (sort-by (juxt #(or (get % "category") "") #(get % "name")))
+                    vec)
+        categories (->> skills (keep #(get % "category")) distinct sort vec)]
+    (ok {"success" true "skills" skills "categories" categories
+         "message" (when (empty? skills) "No skills found in this profile's skills/ directory.")})))
+
+(declare todo-item todo-dedupe)
+
+(defn todo-history-state [history]
+  (loop [[m & more] history calls {} state {:todos [] :revision 0}]
+    (if-not m
+      state
+      (let [role (get m "role")]
+        (cond
+          (= role "assistant")
+          (let [calls' (reduce (fn [acc c]
+                                 (assoc acc (get c "id") (get-in c ["function" "name"])))
+                               calls (get m "tool_calls"))]
+            (recur more calls' state))
+          (= role "tool")
+          (if (= "todo_list" (get calls (get m "tool_call_id")))
+            (let [content (get m "content" "")
+                  parsed (when (and (string? content) (<= (count content) 512000))
+                           (try (h/json-parse content) (catch :default _ nil)))
+                  raw (when (and (map? parsed) (vector? (get parsed "todos"))) (get parsed "todos"))
+                  items (when raw
+                          (try (todo-dedupe (->> raw (filter map?) (take 256) vec))
+                               (catch :default _ [])))
+                  rev (when (map? parsed) (get parsed "revision"))
+                  next-state (if raw
+                               {:todos items :revision (if (and (number? rev) (>= rev 0)) rev 0)}
+                               state)]
+              (recur more calls next-state))
+            (recur more calls state))
+          :else (recur more calls state))))))
+
+(defn- todo-item [item]
+  (when-not (map? item)
+    (throw (ex-info "todo item must be an object" {})))
+  (let [id (str/trim (str (get item "id" "")))
+        content (str/trim (str (get item "content" "")))
+        status (str/lower-case (str/trim (str (get item "status" "pending"))))
+        parent (str/trim (str (get item "parent" "")))
+        marker "… [truncated]"
+        content (if (> (count content) 4000)
+                  (str (subs content 0 (- 4000 (count marker))) marker) content)]
+    (when (str/blank? content)
+      (throw (ex-info (str "Todo item '" (if (str/blank? id) "?" id) "' has empty or missing content.") {})))
+    (cond-> {"id" (if (str/blank? id) "?" id)
+             "content" content
+             "status" (if (#{"pending" "in_progress" "completed" "cancelled"} status) status "pending")}
+      (and (not (str/blank? parent)) (not= parent id)) (assoc "parent" parent))))
+
+(defn- todo-sanitize-parents [items]
+  (let [by-id (into {} (map (juxt #(get % "id") identity) items))]
+    (mapv (fn [item]
+            (loop [node item seen #{(get item "id")}]
+              (if-let [parent (get node "parent")]
+                (cond
+                  (contains? seen parent) (dissoc item "parent")
+                  (not (contains? by-id parent)) (dissoc item "parent")
+                  :else (recur (get by-id parent) (conj seen parent)))
+                item)))
+          items)))
+
+(defn- todo-normalize-order [items]
+  (let [active (first (keep-indexed #(when (= "in_progress" (get %2 "status")) %1) items))
+        pending (first (keep-indexed #(when (= "pending" (get %2 "status")) %1) items))]
+    (if (and (not-any? #(get % "parent") items) active pending (< pending active))
+      (vec (concat (subvec items 0 pending) [(get items active)]
+                   (subvec items pending active) (subvec items (inc active))))
+      items)))
+
+(defn- todo-dedupe [items]
+  (let [clean (mapv todo-item items)
+        last-index (reduce-kv (fn [acc i item] (assoc acc (get item "id") i)) {} clean)
+        ordered (->> last-index (sort-by val) (mapv (fn [[_ i]] (get clean i))) (take 256) vec)]
+    (todo-normalize-order (todo-sanitize-parents ordered))))
+
+(defn- todo-list [ctx {:strs [todos merge]}]
+  (let [items-atom (:todos ctx)
+        revision-atom (:todo-revision ctx)]
+    (try
+      (when (some? todos)
+        (when-not (vector? todos)
+          (throw (ex-info "todos must be a list" {})))
+        (let [before @items-atom
+              next (if merge
+                     (reduce (fn [acc raw]
+                               (let [id (str/trim (str (get raw "id" "")))]
+                                 (if (str/blank? id) acc
+                                   (if-let [idx (first (keep-indexed #(when (= id (get %2 "id")) %1) acc))]
+                                     (let [old (get acc idx)
+                                           content (get raw "content")
+                                           status (some-> (get raw "status") str str/lower-case str/trim)
+                                           updates (cond-> {"id" id}
+                                                     (and content (not (str/blank? (str content)))) (assoc "content" content)
+                                                     (contains? #{"pending" "in_progress" "completed" "cancelled"} status) (assoc "status" status)
+                                                     (contains? raw "parent") (assoc "parent" (get raw "parent")))
+                                           item (todo-item (clojure.core/merge old updates))]
+                                       (assoc acc idx item))
+                                     (conj acc (todo-item raw))))))
+                             before todos)
+                     (todo-dedupe todos))
+              next (todo-dedupe next)]
+          (reset! items-atom next)
+          (when (not= before next) (swap! revision-atom inc))))
+      (let [items @items-atom
+            summary (reduce (fn [m status] (assoc m status (count (filter #(= status (get % "status")) items))))
+                            {"total" (count items)} ["pending" "in_progress" "completed" "cancelled"])]
+        (ok {"todos" items "revision" @revision-atom "summary" summary}))
+      (catch :default e (err (.-message e))))))
+
+(defn- skill-name? [s]
+  (and (string? s) (<= (count s) 64)
+       (re-matches #"^[a-z0-9][a-z0-9._-]*$" s)))
+
+(defn- skill-content-error [content new-skill?]
+  (let [content (str content)
+        content (if (str/starts-with? content "\uFEFF") (subs content 1) content)]
+    (cond
+      (str/blank? content) "Content cannot be empty."
+      (> (count content) 100000) "SKILL.md content exceeds 100000 characters."
+      :else
+      (if-let [[_ frontmatter body]
+               (re-find #"(?s)^---[ \t]*\r?\n(.*?)\r?\n---[ \t]*\r?\n(.*)$" content)]
+        (try
+          (let [meta (yaml/parse frontmatter)
+                description (str (get meta "description" ""))
+                prompt-description (str/trim description)]
+            (cond
+              (not (map? meta)) "Frontmatter must be a YAML mapping (key: value pairs)."
+              (not (contains? meta "name")) "Frontmatter must include 'name' field."
+              (not (contains? meta "description")) "Frontmatter must include 'description' field."
+              (> (count description) 1024) "Description exceeds 1024 characters."
+              (and new-skill? (> (count prompt-description) 60))
+              "New skill description must fit the 60-character system-prompt budget."
+              (str/blank? body) "SKILL.md must have content after the frontmatter (instructions, procedures, etc.)."
+              :else nil))
+          (catch :default e (str "YAML frontmatter parse error: " (.-message e))))
+        (if (str/starts-with? content "---")
+          "SKILL.md frontmatter is not closed. Ensure there is a closing '---' line."
+          "SKILL.md must start with YAML frontmatter (---). See existing skills for format.")))))
+
+(defn- safe-skill-relative? [s]
+  (and (string? s) (not (str/blank? s))
+       (not (str/starts-with? s "/")) (not (str/includes? s "\\"))
+       (not (some #{"" ".." "."} (str/split s #"/")))))
+
+(defn- skill-linked-files [dir]
+  (let [files (h/walk-files dir (fn [_] false))
+        under (fn [folder] (filter #(str/starts-with? % (str folder "/")) files))
+        direct? (fn [folder rel]
+                  (not (str/includes? (subs rel (inc (count folder))) "/")))
+        extension (fn [rel] (some-> rel (str/split #"\.") last str/lower-case))
+        refs (filter #(and (direct? "references" %) (= "md" (extension %))) (under "references"))
+        template-exts #{"md" "py" "yaml" "yml" "json" "tex" "sh"}
+        templates (filter #(contains? template-exts (extension %)) (under "templates"))
+        assets (under "assets")
+        script-exts #{"py" "sh" "bash" "js" "ts" "rb"}
+        scripts (filter #(and (direct? "scripts" %) (contains? script-exts (extension %))) (under "scripts"))]
+    (cond-> {}
+      (seq refs) (assoc "references" (vec refs))
+      (seq templates) (assoc "templates" (vec templates))
+      (seq assets) (assoc "assets" (vec assets))
+      (seq scripts) (assoc "scripts" (vec scripts)))))
+
 (defn skill-view [ctx {:strs [name file_path]}]
   (let [skills (h/join (:home ctx) "skills")
-        dir (or (first (filter #(h/dir? %) [(h/join skills name)]))
-                (first (for [cat (h/ls skills) :let [d (h/join skills cat name)] :when (h/dir? d)] d)))]
-    (if-not dir
-      (err (str "skill not found: " name))
-      (let [f (h/join dir (or file_path "SKILL.md"))]
-        (if (h/file? f) (ok {"name" name "content" (h/slurp f)}) (err (str "no such file in skill: " file_path)))))))
+        parts (when (safe-skill-relative? name) (str/split name #"/"))
+        valid-name? (and (#{1 2} (count parts)) (every? skill-name? parts))
+        skill-files (if (h/dir? skills) (h/walk-files skills (fn [_] false)) [])
+        candidates (when valid-name?
+                     (for [rel skill-files
+                           :when (and (str/ends-with? rel "/SKILL.md")
+                                      (let [segments (str/split rel #"/")
+                                            skill-path (vec (butlast segments))]
+                                        (and (= (count skill-path) (count parts))
+                                             (if (= 1 (count parts))
+                                               (= (first parts) (first skill-path))
+                                               (= parts skill-path)))))]
+                       (h/join skills (subs rel 0 (- (count rel) (count "/SKILL.md"))))))
+        dir (first candidates)]
+    (cond
+      (not valid-name?) (err "skill name must be a name or category/name using safe lowercase path segments")
+      (not dir) (err (str "skill not found: " name))
+      :else
+      (let [relative (or file_path "SKILL.md")
+            available (set (h/walk-files dir (fn [_] false)))
+            f (when (safe-skill-relative? relative) (h/join dir relative))]
+        (cond
+          (nil? f) (err "file_path must be a safe relative path within the skill")
+          (not (contains? available relative)) (err (str "no such file in skill: " relative))
+          (not (readable? ctx "skill_view" f)) (err "skill file is outside this run's readable roots")
+          :else
+          (let [content (h/slurp f)
+                fm (when (= relative "SKILL.md")
+                     (second (re-find #"(?s)^---\s*\n(.*?)\n---(?:\n|$)" content)))
+                meta (when fm (try (yaml/parse fm) (catch :default _ {})))
+                linked (when (= relative "SKILL.md") (skill-linked-files dir))]
+            (ok (cond-> {"success" true "name" name "content" content}
+                  (map? meta) (assoc "description" (get meta "description" "")
+                                     "tags" (get meta "tags" [])
+                                     "related_skills" (get meta "related_skills" []))
+                  (seq linked) (assoc "linked_files" linked
+                                     "usage_hint" (str "To view linked files, call skill_view(name, file_path), for example: "
+                                                       (first (mapcat val linked))))))))))))
+
+(defn- skill-dir [ctx name category]
+  (let [skills (h/join (:home ctx) "skills")]
+    (when (and (skill-name? name)
+               (or (nil? category) (skill-name? category)))
+      (h/join skills (or category "") name))))
+
+(defn- symlink-under? [root abs]
+  (loop [p abs]
+    (cond
+      (nil? p) false
+      (h/symlink? p) true
+      (= p root) false
+      :else (recur (h/dirname p)))))
+
+(defn- skill-snapshot [dir]
+  (when (h/dir? dir)
+    (when (seq (h/walk-symlinks dir))
+      (throw (ex-info (str "skill contains symbolic links; transactional mutation refused: " dir) {})))
+    {:exists true
+     :files (into {}
+                  (map (fn [rel]
+                         (let [file (h/join dir rel)]
+                           [rel {"base64" (h/slurp-base64 file) "mode" (h/file-mode file)}]))
+                       (h/walk-files dir (fn [_] false))))}))
+
+(defn- restore-skill! [dir snapshot]
+  (h/rm dir)
+  (when (:exists snapshot)
+    (h/mkdirs dir)
+    (doseq [[rel file] (:files snapshot)]
+      (h/spit-base64 (h/join dir rel) (get file "base64") (get file "mode")))))
+
+(defn- skill-support-path [dir file-path]
+  (when (and (string? file-path)
+             (not (str/starts-with? file-path "/"))
+             (not (str/includes? file-path "\\"))
+             (not (some #{"" ".." "."} (str/split file-path #"/")))
+             (contains? #{"references" "templates" "scripts" "assets"}
+                        (first (str/split file-path #"/"))))
+    (h/join dir file-path)))
+
+(defn- substring-count [text needle]
+  (loop [offset 0 n 0]
+    (let [at (.indexOf text needle offset)]
+      (if (neg? at) n (recur (+ at (count needle)) (inc n))))))
+
+(defn- skill-manage-one [ctx op]
+  (let [action (get op "action")
+        name (get op "name")
+        dir (skill-dir ctx name (get op "category"))
+        skill-file (when dir (h/join dir "SKILL.md"))
+        skills-root (h/join (:home ctx) "skills")
+        support (when dir (skill-support-path dir (get op "file_path")))
+        fail (fn [s] (err s))]
+    (cond
+      (not dir) (fail "name/category must use lowercase letters, digits, hyphens, or underscores; name is limited to 64 characters")
+      (not (writable? ctx dir)) (fail "skill path is outside this run's writable roots")
+      (or (symlink-under? skills-root dir) (and support (symlink-under? skills-root support)))
+      (fail "skill_manage refuses paths that traverse a symbolic link")
+      (= action "create")
+      (cond
+        (not (string? (get op "content"))) (fail "create requires full SKILL.md content")
+        (skill-content-error (get op "content") true) (fail (skill-content-error (get op "content") true))
+        (h/exists? dir) (fail (str "skill already exists: " name))
+        :else (do (h/mkdirs dir) (h/spit skill-file (get op "content"))
+                  (record-write! ctx skill-file)
+                  (ok {"success" true "action" action "name" name "path" skill-file})))
+
+      (= action "delete")
+      (if-not (and (h/dir? dir) (h/file? skill-file))
+        (fail (str "skill not found: " name))
+        (do (h/rm dir) (record-write! ctx dir)
+            (ok {"success" true "action" action "name" name})))
+
+      (contains? #{"patch" "write_file" "remove_file"} action)
+      (let [target (if (= action "patch") (or support skill-file) support)]
+        (cond
+          (and (not= action "patch") (nil? support)) (fail "file_path must be a relative path under references/, templates/, scripts/, or assets/")
+          (and (= action "patch") (get op "file_path") (nil? support)) (fail "file_path must be a relative path under references/, templates/, scripts/, or assets/")
+          (not (h/file? skill-file)) (fail (str "skill not found: " name))
+          (= action "write_file")
+          (if-not (string? (get op "file_content"))
+            (fail "write_file requires file_content")
+            (if (> (h/utf8-byte-length (get op "file_content")) 1048576)
+              (fail "supporting file content exceeds 1048576 bytes")
+              (do (h/spit target (get op "file_content")) (record-write! ctx target)
+                  (ok {"success" true "action" action "name" name "file_path" (get op "file_path")}))))
+          (= action "remove_file")
+          (if-not (h/file? target) (fail (str "file not found: " (get op "file_path")))
+            (do (h/rm target) (record-write! ctx target)
+                (ok {"success" true "action" action "name" name "file_path" (get op "file_path")})))
+          :else
+          (let [old (get op "old_string") new (get op "new_string")]
+            (cond
+              (and (string? (get op "content")) (not (contains? op "old_string")))
+              (let [content (get op "content")
+                    validation (when (= target skill-file) (skill-content-error content false))]
+                (cond
+                  validation (fail validation)
+                  (> (if (= target skill-file) (count content) (h/utf8-byte-length content))
+                     (if (= target skill-file) 100000 1048576)) (fail "skill file content exceeds the allowed size")
+                  :else (do (h/spit target content) (record-write! ctx target)
+                            (ok {"success" true "action" action "name" name "path" target}))))
+              (or (not (string? old)) (str/blank? old) (not (string? new))) (fail "patch requires non-empty old_string and new_string")
+              (not (h/file? target)) (fail (str "skill file not found: " (get op "file_path" "SKILL.md")))
+              :else
+              (let [text (h/slurp target) matches (substring-count text old)
+                    replace-all (true? (get op "replace_all"))]
+                (cond
+                  (zero? matches) (fail "old_string not found")
+                  (and (> matches 1) (not replace-all)) (fail (str "old_string matched " matches " times; set replace_all=true or make it unique"))
+                  :else (let [updated (if replace-all (str/replace text old new) (str/replace-first text old new))
+                              validation (when (= target skill-file) (skill-content-error updated false))]
+                          (cond
+                            validation (fail validation)
+                            (> (if (= target skill-file) (count updated) (h/utf8-byte-length updated))
+                               (if (= target skill-file) 100000 1048576)) (fail "skill file content exceeds the allowed size")
+                            :else (do (h/spit target updated)
+                                      (record-write! ctx target)
+                                      (ok {"success" true "action" action "name" name "path" target})))))))))
+
+      :else (fail "unsupported skill_manage action")))))
+
+(defn skill-manage [ctx {:strs [operations]}]
+  (cond
+    (not (and (vector? operations) (<= 1 (count operations) 20) (every? map? operations)))
+    (err "operations must contain between 1 and 20 skill operation objects")
+    (and (> (count operations) 1) (some #(= "delete" (get % "action")) operations))
+    (err "delete must be the sole skill_manage operation")
+    :else
+    (let [root (h/join (:home ctx) "skills")
+          dirs (mapv #(skill-dir ctx (get % "name") (get % "category")) operations)]
+      (cond
+        (h/symlink? root) (err "skill_manage refuses a symbolic-link skills directory")
+        (some nil? dirs)
+        (err "name/category must use lowercase letters, digits, hyphens, or underscores; name is limited to 64 characters")
+        :else
+        (h/with-lock
+         (h/join root ".kotoba-skill-manage.lock")
+         (fn []
+           (let [snapshots (atom nil)
+                 staged-writes (atom [])
+                 rollback! (fn []
+                             (doseq [[dir snap] @snapshots]
+                               (restore-skill! dir snap)))]
+             (try
+               (doseq [[op dir] (map vector operations dirs)]
+                 (let [support (when (get op "file_path")
+                                 (skill-support-path dir (get op "file_path")))]
+                   (when (or (symlink-under? root dir)
+                             (and (get op "file_path") (nil? support))
+                             (and support (symlink-under? root support)))
+                     (throw (ex-info "skill_manage refuses unsafe or symbolic-link paths" {})))))
+               (reset! snapshots (into {} (map (fn [dir] [dir (skill-snapshot dir)]) (distinct dirs))))
+               (let [ctx' (assoc ctx :writes staged-writes)
+                     outcome (loop [[op & more] operations results []]
+                               (if (nil? op)
+                                 {:results results}
+                                 (let [raw (skill-manage-one ctx' op)
+                                       data (try (h/json-parse raw) (catch :default _ {}))]
+                                   (if (or (get data "error") (false? (get data "success")))
+                                     {:failure raw}
+                                     (recur more (conj results data))))))]
+                 (if-let [failure (:failure outcome)]
+                   (do (rollback!) failure)
+                   (do (when-let [writes (:writes ctx)] (swap! writes into @staged-writes))
+                       (ok {"success" true "results" (:results outcome)}))))
+               (catch :default e
+                 (let [rollback-error (try
+                                        (when @snapshots (rollback!))
+                                        nil
+                                        (catch :default rollback-error rollback-error))]
+                   (err (cond-> (.-message e)
+                          rollback-error (str "; rollback failed: " (.-message rollback-error))))))))))))))
 
 (defn memory [ctx {:strs [action target content old_text new_text]}]
   (let [f (h/join (:home ctx) "memories" (if (= target "user") "USER.md" "MEMORY.md"))
@@ -310,10 +911,134 @@
       (do (h/spit f (str/join "\n§\n" entries'))
           (ok {"entries" (count entries')})))))
 
+(defn- sqlite-records [db sql & params]
+  (let [stmt (.prepare db sql)]
+    (js->clj (js/Reflect.apply (.-all stmt) stmt (clj->js params)))))
+
+(defn session-search
+  "Read-only local-profile history search. Cross-profile lookup and Hermes' adaptive detail mode are intentionally unavailable."
+  [ctx {:strs [query limit session_id around_message_id window role_filter]}]
+  (let [db-path (h/join (:home ctx) "state.db")
+        limit (if (number? limit) (max 1 (min 20 (int limit))) 5)
+        window (if (number? window) (max 1 (min 20 (int window))) 5)
+        role-filter (or role_filter "user,assistant")
+        roles (case role-filter
+                "user,assistant" ["user" "assistant"]
+                "user,assistant,tool" ["user" "assistant" "tool"]
+                "user" ["user"]
+                "assistant" ["assistant"]
+                "tool" ["tool"]
+                nil)]
+    (cond
+      (not roles) (err "session_search role_filter must be one of the advertised values")
+      (and around_message_id (not session_id)) (err "session_search around_message_id requires session_id")
+      (not (h/file? db-path)) (err "session_search requires this profile's state.db")
+      (not (readable? ctx "session_search" db-path)) (err "session_search denied by this run's read policy")
+      :else
+      (let [db (sqlite/DatabaseSync. db-path #js {:readOnly true})]
+        (try
+          (.exec db "PRAGMA query_only = ON")
+          (let [source-filter "COALESCE(s.source, '') NOT IN ('tool', 'delegate', 'kanban')"
+                hidden-filter "COALESCE(s.hidden, 0) = 0"
+                role-sql (str/join "," (map #(str "'" % "'") roles))
+                result
+                (cond
+                  session_id
+                  (if around_message_id
+                    (sqlite-records db
+                      (str "WITH numbered AS (SELECT m.id, m.role, m.content, m.timestamp, "
+                           "ROW_NUMBER() OVER (ORDER BY m.id) AS rn FROM messages m "
+                           "JOIN sessions s ON s.id = m.session_id WHERE s.id = ? AND " hidden-filter " AND " source-filter ") "
+                           "SELECT id, role, content, timestamp FROM numbered WHERE rn BETWEEN "
+                           "MAX(1, (SELECT rn FROM numbered WHERE id = ?) - ?) AND "
+                           "(SELECT rn FROM numbered WHERE id = ?) + ? "
+                           "AND (SELECT rn FROM numbered WHERE id = ?) IS NOT NULL ORDER BY rn")
+                      session_id around_message_id window around_message_id window around_message_id)
+                    (sqlite-records db
+                      (str "SELECT m.id, m.role, m.content, m.timestamp FROM messages m "
+                           "JOIN sessions s ON s.id = m.session_id WHERE s.id = ? AND " hidden-filter " AND " source-filter " "
+                           "ORDER BY m.id DESC LIMIT ?")
+                      session_id limit))
+
+                  (not (str/blank? (or query "")))
+                  (sqlite-records db
+                    (str "SELECT s.id AS session_id, s.title, s.started_at, s.message_count, "
+                         "m.id AS match_message_id, m.role, m.content, m.timestamp, "
+                         "snippet(messages_fts, 0, '[', ']', ' … ', 16) AS snippet "
+                         "FROM messages_fts JOIN messages m ON m.id = messages_fts.rowid "
+                         "JOIN sessions s ON s.id = m.session_id WHERE messages_fts MATCH ? AND "
+                         hidden-filter " AND " source-filter " AND m.role IN (" role-sql ") "
+                         "ORDER BY bm25(messages_fts), m.id DESC LIMIT ?")
+                    query limit)
+
+                  :else
+                  (sqlite-records db
+                    (str "SELECT s.id AS session_id, s.title, s.started_at, s.message_count "
+                         "FROM sessions s WHERE " hidden-filter " AND " source-filter " "
+                         "ORDER BY COALESCE(s.last_activity_at, s.started_at) DESC LIMIT ?")
+                    limit))
+                result (if (and session_id (not around_message_id)) (vec (reverse result)) result)]
+            (ok {"mode" (cond session_id (if around_message_id "scroll" "read")
+                              (str/blank? (or query "")) "browse" :else "discover")
+                 "profile" (:profile ctx)
+                 "count" (count result)
+                 "results" (mapv (fn [row]
+                                   (cond-> row
+                                     (contains? row "content") (update "content" #(clip (str %) 4000))))
+                                 result)}))
+          (finally (.close db)))))))
+
+(defn- ha-tool [name]
+  (fn [ctx args] (homeassistant/call ctx name args)))
+
+(defn execute-code
+  "Run one Python source string on stdin under the same OS confinement,
+  sanitized environment, and write-root policy as terminal. Hermes' persistent
+  kernel and in-script `hermes_tools` RPC are not emulated here."
+  [ctx {:strs [code timeout]}]
+  (cond
+    (not (and (string? code) (not (str/blank? code))))
+    (err "execute_code requires non-empty Python source in `code`")
+
+    (and (:roots ctx) (not (writable? ctx (:cwd ctx))))
+    (err (str "execute_code refused: workdir outside this run's roots: " (:cwd ctx)))
+
+    :else
+    (let [pol (policy ctx)
+          c (confine/command pol {:argv ["python3" "-"]
+                                  :write-roots (or (:roots ctx) [(:cwd ctx)])
+                                  :read-roots (read-roots ctx)
+                                  :tool-env (:tool-env ctx)
+                                  :home (host-home ctx)
+                                  :backend (backend ctx)})]
+      (if-let [why (:refused c)]
+        (err (str "execute_code refused: " why))
+        (let [timeout-s (if (number? timeout) (max 1 (min 300 timeout)) 300)
+              r (try (h/run-process (:argv c) {:cwd (:cwd ctx) :exact-env? true :env (:env c)
+                                               :input code :timeout-ms (* 1000 timeout-s)})
+                     (finally (when (:tmpdir c) (h/rm (:tmpdir c)))))
+              output (str (:stdout r) (when-not (str/blank? (:stderr r))
+                                        (str "\n[stderr]\n" (:stderr r))))]
+          (confine/audit! {:tool "execute_code" :profile (:profile ctx) :peer? (:peer? pol)
+                           :sandbox (:sandbox c) :cmd "python3 -" :exit (:exit r)
+                           :stderr (:stderr r) :timed-out? (:timed-out? r)})
+          (ok {"output" (clip output 50000)
+               "exit_code" (:exit r)
+               "sandbox" (name (:sandbox c))
+               "error" (when (:timed-out? r) "timeout")
+               "persistent" false
+               "tool_rpc" false}))))))
+
 (def impls
-  {"terminal" terminal "read_file" read-file "write_file" write-file "patch" patch
+  {"terminal" terminal "process_manage" process/manage "read_file" read-file "write_file" write-file "patch" patch
    "search_files" search-files "web_extract" web-extract "web_search" web-search
-   "skill_view" skill-view "memory" memory})
+   "skills_list" skills-list "skill_view" skill-view "skill_manage" skill-manage
+   "todo_list" todo-list "memory" memory "execute_code" execute-code
+   "session_search" session-search
+   "ha_list_entities" (ha-tool "ha_list_entities")
+   "ha_get_state" (ha-tool "ha_get_state")
+   "ha_list_services" (ha-tool "ha_list_services")
+   "ha_call_service" (ha-tool "ha_call_service")})
 
 (defn call
   "Run one tool call. Always resolves to a result string."
@@ -323,5 +1048,7 @@
     (cond
       (= args ::bad) (p/resolved (err (str "invalid JSON arguments for " name)))
       (not (some #{name} allowed)) (p/resolved (err (str "tool not available in this run: " name)))
-      :else (-> (p/do ((get impls name) ctx args))
-                (p/catch (fn [e] (err (str name ": " (.-message e)))))))))
+      :else (if-let [f (or (get impls name) (get (:tool-overrides ctx) name))]
+              (-> (p/do (f ctx args))
+                  (p/catch (fn [e] (err (str name ": " (.-message e))))))
+              (p/resolved (err (str "tool executor not configured for " name)))))))

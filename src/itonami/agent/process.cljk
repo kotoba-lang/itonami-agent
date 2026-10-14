@@ -1,0 +1,157 @@
+(ns itonami.agent.process
+  "Background terminal processes for one Kotoba agent runtime. A registry is
+  scoped to the profile home; results stay bounded in memory and are not
+  restored after the agent process restarts."
+  (:require [clojure.string :as str]
+            [promesa.core :as p]
+            [itonami.agent.host :as h]))
+
+(def ^:private child-process (js/require "node:child_process"))
+(def ^:private max-output-chars 200000)
+(def ^:private max-processes 64)
+(def ^:private max-retained-results 64)
+(def ^:private retention-ms (* 7 24 60 60 1000))
+(defonce ^:private sessions (atom {}))
+
+(defn- prune-sessions! [home]
+  (let [now (h/now-ms)
+        completed (->> @sessions
+                       (filter (fn [[_ s]] (and (= home (:home s)) (= :exited @(:state s)))))
+                       (sort-by (fn [[_ s]] (or @(:finished-at s) (:started-at s)))))]
+    (doseq [[id s] completed
+            :when (> (- now (or @(:finished-at s) (:started-at s))) retention-ms)]
+      (swap! sessions dissoc id))
+    (let [remaining (remove (fn [[id _]]
+                              (not (contains? @sessions id))) completed)
+          excess (max 0 (- (count remaining) max-retained-results))]
+      (doseq [[id _] (take excess remaining)]
+        (swap! sessions dissoc id)))))
+
+(defn- finish! [session code detail on-exit tmpdir]
+  (when (compare-and-set! (:state session) :running :exited)
+    (reset! (:exit-code session) code)
+    (reset! (:finished-at session) (h/now-ms))
+    (try
+      (when on-exit (on-exit code detail))
+      (finally
+        (when tmpdir (h/rm tmpdir))
+        (prune-sessions! (:home session))))))
+
+(defn- append-output! [session chunk]
+  (swap! (:output session)
+         (fn [s]
+           (let [s (str s (.toString chunk "utf8"))]
+             (subs s (max 0 (- (count s) max-output-chars)))))))
+
+(defn- process-status [session]
+  (if (= :running @(:state session)) "running" "exited"))
+
+(defn- result-base [session]
+  {"session_id" (:id session)
+   "command" (:command session)
+   "status" (process-status session)
+   "pid" (.-pid (:child session))
+   "cwd" (:cwd session)
+   "uptime_seconds" (max 0 (quot (- (h/now-ms) (:started-at session)) 1000))})
+
+(defn spawn!
+  "Start the already-confined argv from confine/command. The caller owns the
+  policy decision and audit record; this namespace only manages the child."
+  [ctx {:keys [argv env cwd tmpdir command on-exit]}]
+  (let [home (:home ctx)
+        _ (prune-sessions! home)
+        running (filter #(and (= home (:home %)) (= :running @(:state %))) (vals @sessions))]
+    (cond
+      (>= (count running) max-processes)
+      (h/json-str {"error" (str "background process limit reached (" max-processes ")")})
+
+      :else
+      (let [id (str "proc_" (h/random-hex 6))
+            child (try
+                    (.spawn child-process (first argv) (clj->js (subvec (vec argv) 1))
+                            #js {:cwd cwd :env (clj->js env) :detached true
+                                 :stdio #js ["pipe" "pipe" "pipe"]})
+                    (catch :default e e))
+            session {:id id :home home :command command :cwd cwd :child child
+                     :started-at (h/now-ms) :finished-at (atom nil)
+                     :state (atom :running) :exit-code (atom nil)
+                     :output (atom "")}]
+        (if (instance? js/Error child)
+          (do (when tmpdir (h/rm tmpdir))
+              (h/json-str {"error" (str "background spawn failed: " (.-message child))}))
+          (do
+            (swap! sessions assoc id session)
+            (.on (.-stdout child) "data" #(append-output! session %))
+            (.on (.-stderr child) "data" #(append-output! session %))
+            (.on child "error" (fn [e]
+                                 (finish! session -1 (str (.-message e)) on-exit tmpdir)))
+            (.on child "close" (fn [code signal]
+                                 (finish! session code (when signal (str "signal " signal)) on-exit tmpdir)))
+            (h/json-str (merge (result-base session)
+                               {"status" "running"
+                                "note" "Use process_manage to poll, wait, read logs, send stdin, or terminate."}))))))))
+
+(defn- resolve-session [ctx requested]
+  (let [matches (filter (fn [[id s]] (and (= (:home ctx) (:home s))
+                                             (str/starts-with? id (str requested)))) @sessions)]
+    (cond
+      (empty? matches) {:error (str "process not found: " requested)}
+      (> (count matches) 1) {:error (str "ambiguous session_id prefix: " requested)}
+      :else (val (first matches)))))
+
+(defn- snapshot [session]
+  (merge (result-base session)
+         {"exit_code" @(:exit-code session)
+          "output_preview" (let [s @(:output session)] (subs s (max 0 (- (count s) 1000))))}))
+
+(defn- read-log [session offset limit]
+  (let [lines (str/split-lines @(:output session))
+        total (count lines)
+        start (if (nil? offset) (max 0 (- total limit)) (max 0 offset))
+        selected (take limit (drop start lines))]
+    (merge (result-base session)
+           {"output" (str/join "\n" selected)
+            "total_lines" total
+            "showing" (str (count selected) " lines")})))
+
+(defn- wait-result [session timeout-s]
+  (let [timeout-ms (* 1000 (max 1 (min 1800 (or timeout-s 180))))
+        started (h/now-ms)]
+    (p/loop []
+      (cond
+        (= :exited @(:state session)) (snapshot session)
+        (>= (- (h/now-ms) started) timeout-ms) (assoc (snapshot session) "timed_out" true)
+        :else (p/let [_ (p/delay 100)] (p/recur))))))
+
+(defn manage
+  "Hermes-shaped background process actions, scoped to this profile home."
+  [ctx {:strs [action session_id data timeout offset limit]}]
+  (prune-sessions! (:home ctx))
+  (if (= action "list")
+    (h/json-str {"processes" (mapv snapshot (filter #(= (:home ctx) (:home %)) (vals @sessions)))})
+    (let [session (when session_id (resolve-session ctx session_id))]
+      (cond
+        (nil? session_id) (h/json-str {"error" (str "session_id is required for " action)})
+        (:error session) (h/json-str session)
+        (= action "poll") (h/json-str (snapshot session))
+        (= action "log") (h/json-str (read-log session offset (max 1 (min 2000 (or limit 200)))))
+        (= action "wait") (p/then (wait-result session timeout) h/json-str)
+        (= action "kill")
+        (if (= :exited @(:state session))
+          (h/json-str (merge (snapshot session) {"status" "already_exited"}))
+          (try
+            (js/process.kill (- (.-pid (:child session))) "SIGTERM")
+            (h/json-str {"status" "terminating" "session_id" (:id session)})
+            (catch :default e (h/json-str {"status" "error" "error" (.-message e)}))))
+        (or (= action "write") (= action "submit") (= action "close"))
+        (if (or (= :exited @(:state session)) (nil? (.-stdin (:child session))))
+          (h/json-str {"status" "error" "error" "process stdin is unavailable or already closed"})
+          (try
+            (case action
+              "write" (.write (.-stdin (:child session)) (str data))
+              "submit" (.write (.-stdin (:child session)) (str data "\n"))
+              "close" (.end (.-stdin (:child session))))
+            (h/json-str {"status" "ok" "session_id" (:id session)})
+            (catch :default e (h/json-str {"status" "error" "error" (.-message e)}))))
+        (= action "handoff") (h/json-str {"error" "process handoff is unavailable because Kotoba delegation ownership is not implemented"})
+        :else (h/json-str {"error" (str "unknown process action: " action)})))))

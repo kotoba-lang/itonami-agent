@@ -1,0 +1,157 @@
+(ns itonami.agent.homeassistant
+  "Hermes-compatible Home Assistant REST tools using secrets from the active profile."
+  (:require [clojure.string :as str]
+            [promesa.core :as p]
+            [itonami.agent.host :as h]))
+
+(def ^:private entity-id-re #"^[a-z_][a-z0-9_]*\.[a-z0-9_]+$")
+(def ^:private service-name-re #"^[a-z][a-z0-9_]*$")
+(def ^:private blocked-domains
+  #{"shell_command" "command_line" "python_script" "pyscript" "hassio" "rest_command"})
+(def ^:private max-response-bytes (* 2 1024 1024))
+
+(defn- env-value [ctx key default]
+  (or (get (:tool-env ctx) key)
+      (h/env key)
+      default))
+
+(defn- base-url [ctx]
+  (let [raw (str/replace (str (env-value ctx "HASS_URL" "http://homeassistant.local:8123")) #"/+$" "")
+        u (try (js/URL. raw) (catch :default _ nil))]
+    (when (or (nil? u)
+              (not (#{"http:" "https:"} (.-protocol u)))
+              (str/blank? (.-hostname u))
+              (seq (.-username u))
+              (seq (.-password u))
+              (seq (.-search u))
+              (seq (.-hash u)))
+      (throw (ex-info "invalid HASS_URL: expected an http(s) base URL without credentials, query, or fragment" {})))
+    raw))
+
+(defn- api-json [ctx method path payload]
+  (let [token (env-value ctx "HASS_TOKEN" "")
+        _ (when (str/blank? token)
+            (throw (ex-info "HASS_TOKEN is not configured for this profile" {})))
+        base (base-url ctx)
+        url (js/URL. (str base path))
+        opts #js {:method method
+                  :headers #js {"Authorization" (str "Bearer " token)
+                                "Content-Type" "application/json"
+                                "Accept" "application/json"}
+                  :redirect "manual"
+                  :signal (.timeout js/AbortSignal 15000)}
+        _ (when payload (aset opts "body" (js/JSON.stringify (clj->js payload))))]
+    (-> (.fetch js/globalThis url opts)
+        (p/then (fn [response]
+                  (let [status (.-status response)]
+                    (when (<= 300 status 399)
+                      (throw (ex-info "Home Assistant redirects are refused" {:status status})))
+                    (when-not (.-ok response)
+                      (throw (ex-info (str "Home Assistant returned HTTP " status) {:status status})))
+                    (let [content-length (.get (.-headers response) "content-length")]
+                      (when (and content-length
+                                 (> (js/parseInt content-length 10) max-response-bytes))
+                        (throw (ex-info "Home Assistant response exceeds 2 MiB" {}))))
+                    (p/then (.text response)
+                            (fn [body]
+                              (when (> (js/Buffer.byteLength body "utf8") max-response-bytes)
+                                (throw (ex-info "Home Assistant response exceeds 2 MiB" {})))
+                              (try
+                                (js->clj (js/JSON.parse body))
+                                (catch :default _
+                                  (throw (ex-info "Home Assistant returned invalid JSON" {}))))))))))))
+
+(defn- json-result [value]
+  (h/json-str {"result" value}))
+
+(defn- failure [e]
+  (h/json-str {"error" (or (.-message e) (str e))}))
+
+(defn- valid-entity! [entity-id]
+  (when-not (and (string? entity-id) (re-matches entity-id-re entity-id))
+    (throw (ex-info (str "Invalid entity_id format: " entity-id) {})))
+  entity-id)
+
+(defn- list-entities [ctx {:strs [domain area]}]
+  (-> (api-json ctx "GET" "/api/states" nil)
+      (p/then (fn [states]
+                (let [states (filter (fn [state]
+                                       (and (or (str/blank? domain)
+                                                (str/starts-with? (get state "entity_id" "") (str domain ".")))
+                                            (or (str/blank? area)
+                                                (let [a (str/lower-case area)
+                                                      attrs (get state "attributes" {})]
+                                                  (or (str/includes? (str/lower-case (get attrs "friendly_name" "")) a)
+                                                      (str/includes? (str/lower-case (get attrs "area" "")) a))))))
+                                     states)
+                      entities (mapv (fn [state]
+                                       {"entity_id" (get state "entity_id")
+                                        "state" (get state "state")
+                                        "friendly_name" (get-in state ["attributes" "friendly_name"] "")})
+                                     states)]
+                  (json-result {"count" (count entities) "entities" entities}))))
+      (p/catch failure)))
+
+(defn- get-state [ctx {:strs [entity_id]}]
+  (valid-entity! entity_id)
+  (-> (api-json ctx "GET" (str "/api/states/" entity_id) nil)
+      (p/then (fn [state]
+                (json-result (select-keys state ["entity_id" "state" "attributes" "last_changed" "last_updated"]))))
+      (p/catch failure)))
+
+(defn- list-services [ctx {:strs [domain]}]
+  (-> (api-json ctx "GET" "/api/services" nil)
+      (p/then (fn [services]
+                (let [services (filter #(or (str/blank? domain) (= domain (get % "domain"))) services)
+                      result (mapv (fn [entry]
+                                     {"domain" (get entry "domain" "")
+                                      "services" (into {}
+                                                       (map (fn [[service info]]
+                                                              [service
+                                                               (cond-> {"description" (get info "description" "")}
+                                                                 (seq (get info "fields"))
+                                                                 (assoc "fields"
+                                                                        (into {}
+                                                                              (map (fn [[field details]]
+                                                                                     [field (get details "description" "")])
+                                                                                   (get info "fields")))))]))
+                                                       (get entry "services" {}))})
+                                   services)]
+                  (json-result {"count" (count result) "domains" result}))))
+      (p/catch failure)))
+
+(defn- call-service [ctx {:strs [domain service entity_id data]}]
+  (when-not (and (string? domain) (re-matches service-name-re domain))
+    (throw (ex-info (str "Invalid domain format: " (pr-str domain)) {})))
+  (when-not (and (string? service) (re-matches service-name-re service))
+    (throw (ex-info (str "Invalid service format: " (pr-str service)) {})))
+  (when (contains? blocked-domains domain)
+    (throw (ex-info (str "Service domain '" domain "' is blocked for security") {})))
+  (when entity_id (valid-entity! entity_id))
+  (let [data (cond
+               (nil? data) {}
+               (map? data) data
+               (string? data) (try
+                                (if (str/blank? data) {}
+                                    (js->clj (js/JSON.parse data)))
+                                (catch :default _
+                                  (throw (ex-info "Invalid JSON string in 'data' parameter" {}))))
+               :else (throw (ex-info "data must be a JSON object or JSON string" {})))
+        payload (cond-> data entity_id (assoc "entity_id" entity_id))]
+    (-> (api-json ctx "POST" (str "/api/services/" domain "/" service) payload)
+        (p/then (fn [result]
+                  (let [affected (if (vector? result)
+                                   (mapv #(select-keys % ["entity_id" "state"]) result)
+                                   [])]
+                    (json-result {"success" true
+                                  "service" (str domain "." service)
+                                  "affected_entities" affected}))))
+        (p/catch failure))))
+
+(defn call [ctx name args]
+  (case name
+    "ha_list_entities" (list-entities ctx args)
+    "ha_get_state" (get-state ctx args)
+    "ha_list_services" (list-services ctx args)
+    "ha_call_service" (call-service ctx args)
+    (failure (ex-info (str "unknown Home Assistant tool: " name) {}))))
