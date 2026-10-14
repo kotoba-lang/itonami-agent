@@ -241,8 +241,8 @@
 (defn audit!
   "One line per confined command in <itonami-dir>/logs/terminal-sandbox.jsonl,
   so a rollout can see which turns the policy got in the way of."
-  [{:keys [profile peer? sandbox cmd exit stderr timed-out?]}]
-  (audit-line! {"tool" "terminal" "profile" profile "peer" (boolean peer?)
+  [{:keys [tool profile peer? sandbox cmd exit stderr timed-out?]}]
+  (audit-line! {"tool" (or tool "terminal") "profile" profile "peer" (boolean peer?)
                 "sandbox" (name sandbox) "exit" exit "timed_out" (boolean timed-out?)
                 "suspected_denial" (boolean (and stderr (re-find denial-signs stderr)))
                 "cmd" (clip200 cmd)}))

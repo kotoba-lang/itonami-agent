@@ -1,8 +1,8 @@
 # itonami-agent
 
 A Hermes-compatible agent written in kotoba (`.cljk` on kbb), with peer-to-peer
-execution of agent turns. No dependencies beyond the kbb engine; no JVM, no
-Python, no npm packages.
+execution of agent turns. The agent core needs only the kbb engine; no JVM or
+npm packages. Cron jobs written in Hy additionally need Python with Hy installed.
 
 ```
 bin/itonami-agent -p hiraku-soudan -z "質問"            # one turn, like `hermes -p … -z`
@@ -22,13 +22,41 @@ the two can be swapped per profile.
 | `SOUL.md`, `profile.yaml`, `config.yaml`, `.env`, `secrets.command` | read the same way. YAML reader is checked against PyYAML on all 1,954 host files: 0 differences |
 | `model` / `providers` / `fallback_providers`, job pin disables fallback | same resolution order (`cron/scheduler.py`, `runtime_provider_custom.py`) |
 | `agent.max_turns`, `agent.run_budget_seconds` (80 % wrap-up notice, hop timeout ≤ ½ remaining budget) | same; plus up to 3 rounds over the chain with backoff when every hop failed transiently (429 / 5xx / transport) |
-| tools `terminal read_file write_file patch search_files web_search web_extract skill_view memory`; toolsets `hermes-cli`, `hermes-cron`, `terminal`, `file`, `web`, `skills`, `memory` | same names and argument shapes; results are JSON strings |
-| `cron/jobs.json` (all fields), 5-field cron / interval / once schedules | read and written in Hermes' format; Hermes' own `cron.jobs.load_jobs()` / `get_due_jobs()` read what itonami writes |
+| tools `terminal process_manage read_file write_file patch search_files web_search web_extract skills_list skill_view skill_manage todo_list delegate_task cronjob_manage memory execute_code session_search ha_list_entities ha_get_state ha_list_services ha_call_service`; toolsets `terminal`, `file`, `web`, `search`, `skills`, `todo`, `memory`, `session_search`, `code_execution`, `homeassistant` | these names have Kotoba handlers and JSON-string results; some semantics remain partial. `terminal(background=true)` and `process_manage` provide background terminal processes, but their registry is in-memory and is not restored after the agent runtime restarts; process handoff is unavailable. Kotoba `execute_code` runs one confined, stateless Python source string and does not expose `hermes_tools` RPC. Kotoba `session_search` reads only the current profile's local `state.db` and supports bounded browse, FTS discovery, read, and scroll; cross-profile lookup and Hermes adaptive detail are not implemented. `hermes-cli`/`hermes-cron` retain Hermes' full core inventory and refuse to start when any selected tool is unsupported, rather than silently presenting a reduced bundle |
+| `cron/jobs.json` (including `monitor_script` / `monitor_url`), 5-field cron / interval / once schedules | read and written in Hermes' format; Kotoba can create, list, and update monitor jobs, then evaluates the monitor before the agent turn |
+| Pre-run script extensions `.sh`/`.bash`, `.cljk`, `.js`/`.mjs`, `.py`, `.hy` | extension dispatch; `.hy` runs through `hy.cmdline.hy_main` with the job/config-selected Python, which must have Hy installed |
 | cron prompt: `_CRON_HINT`, `## Script Output` / `## Script Error` block, empty stdout and `{"wakeAgent": false}` skip, `[SILENT]`, `[CRON_FAILURE]` | identical text and semantics |
 | `cron/output/<id>/<YYYY-MM-DD_HH-MM-SS>.md`, newest 50, mode 0600 | identical layout (adds `**Engine:**` / `**Peer:**` lines) |
 | `usage_audit.jsonl`, `ticker_heartbeat`, `ticker_last_success` | written |
-| `-p`, `-z` (stdout = final text, exit 1 + `… -z: reason` on stderr), `-m`, `--provider`, `-t`, `cron list/create/run/tick/runs/status`, `profile list/show`, `chat` | same flags |
-| `executions.db`, incidents, notepad, messaging gateway adapters, `delegate_task`, browser tools, MCP | **not implemented**; itonami logs runs to `cron/itonami-runs.jsonl` |
+| `-p`, `-z` (stdout = final text, exit 1 + `… -z: reason` on stderr), `-m`, `--provider`, `-t`, `cron list/create/run/tick/runs/status`, `profile list/show`, `chat` | same commands; `cron create` also accepts `--no-agent`, `--monitor-script`, and `--monitor-url` |
+| `cron/executions.db` | Kotoba writes Hermes-shaped claimed/running/completed/failed rows with ownership, timestamps, and delivery outcome. A later run marks attempts `unknown` only when the prior owner is provably gone; it does not retry them automatically. Handoff adoption is not implemented |
+| `cron incidents` / `cron incidents ack <id>` | Kotoba groups failures by Hermes-compatible job/error signature, resolves them after success, and records acknowledgements and delivery outcomes. The delivery adapter and repeat-alert gate are not wired |
+| configured MCP stdio and Streamable HTTP servers | discovered from `mcp_servers`, exposed as `mcp__server__tool`, and invoked with profile-scoped environment values and configured HTTP headers. Cached OAuth tokens can refresh with issuer binding and a Kotoba process lock; interactive OAuth login remains unsupported. MCP subprocesses are disabled on peer runs |
+| browser navigation, snapshot, click, type, scroll, back, key press, image listing, screenshot vision, console | local Chrome through `agent-browser`; a Kotoba loopback proxy checks the allowlist and every DNS result for HTTP, HTTPS CONNECT, redirects, and subresources, pins the selected public IP, disables Chromium's implicit loopback proxy bypass, and closes the per-run session at loop end. Browser output is scrubbed for common credential forms. Cloud/CDP backends, raw CDP, dialog control, vault tools, and `browser_exec` remain unsupported and readiness-blocked |
+| notepad, messaging gateway adapters | **not implemented**; Kotoba also keeps its detailed local run log in `cron/itonami-runs.jsonl` |
+
+`delegate_task` is currently limited to up to three parallel foreground turns.
+Hermes background/list/steer/stop controls for agent turns, image inputs, and
+output-schema validation are not implemented. This is partial tool-contract
+coverage, not full Hermes agent parity.
+
+Home Assistant uses the profile's `HASS_URL` / `HASS_TOKEN` (default URL:
+`http://homeassistant.local:8123`); redirects are refused and the service-call
+domains that can execute commands or issue arbitrary HTTP requests are blocked.
+`ha_call_service` requires approval. `skill_manage` has remaining
+staged-review/curator differences from Hermes, and cron delivery adapters are
+not wired. These limitations must be closed before claiming full agent parity
+or adopting profiles that depend on them.
+
+The CLJK turn API accepts prior user/assistant history and per-request
+instructions, in addition to the current prompt. Tool rows remain scoped to the
+turn that produced them; only the user/assistant transcript is carried into the
+next request, matching the current Kotoba Desktop gateway's normalized history.
+
+`itonami-agent bridge` exposes this turn API to a local host over stdin/stdout:
+one JSON request containing an explicit `tool_names` array, then JSONL event rows
+and one terminal result row. It refuses any requested tool the Kotoba agent
+does not implement; it never silently narrows a caller's requested tool set.
 
 ## itonami profile
 
@@ -75,10 +103,44 @@ is an index, not authority: `:authority` only points at `yakuwari.edn`.
 
 Exactly one scheduler ticks a profile:
 
+- `profile readiness <p>|--all` checks active cron jobs for unsupported Kotoba
+  tools, missing/unrefreshable OAuth caches, and non-local delivery lanes.
 - `profile adopt <p>` sets `:scheduler :itonami` and writes Hermes'
   `gateway.parked` marker, so the Hermes gateway stops ticking it;
-  `gateway run` then ticks it.
-- `profile release <p>` reverses both.
+  `gateway run` then ticks it. `profile adopt --all --dry-run` previews a
+  fleet-wide ownership change. Fleet adoption refuses the whole operation if
+  any profile fails the Kotoba readiness check.
+- `profile adopt --ready-only [--dry-run]` adopts every currently ready profile
+  and reports blocked profiles individually. This supports staged fleet
+  migration while preserving the all-or-nothing behavior of `--all`. Profiles
+  owned by a scheduler other than Hermes or Kotoba are refused until that
+  scheduler is explicitly retired.
+- `profile release <p>` reverses both. `profile release --all --dry-run`
+  previews a fleet rollback; `profile release --all` applies it.
+- `profile refresh-bundle <p>` recomputes the CID after files change without
+  replacing the rest of `itonami.edn` (including custom bundle directories and
+  scheduler ownership).
+- `profile hy-stage <p>|--all <artifact-dir> [--dry-run]` verifies the staged
+  migration manifest and every source/payload hash before copying sibling `.hy`
+  files into profile `scripts/`. It leaves `.py` sources and job references intact;
+  Kotoba-owned bundle CIDs are refreshed after files are staged.
+- `profile hy-migrate <p>|--all [--dry-run]` switches cron `script` and
+  `monitor_script` references only when a sibling `.hy` file exists, the profile
+  is readiness-clean, and Kotoba owns its scheduler with Hermes parked. Apply
+  mode holds the Kotoba tick lock and updates only the job fields, preserving
+  `.py` sources, job run state, and unknown `jobs.json` metadata.
+
+Hy cron scripts use the first configured interpreter among the job's
+`interpreter`, `cron.script_python`, `ITONAMI_PYTHON`, `HERMES_PYTHON`, then
+`python3`. The fleet target is Hy 1.3.1, supported on Python 3.9 through 3.15.
+The dispatcher inserts the script directory into `sys.path` and preserves
+arguments after the script path, matching the `.py` job contract. When launched
+by Kotoba Gateway, the scheduler uses `KOTOBA_HY_DEPS` when configured; otherwise
+it discovers Hy and `funcparserlib` in the main environments under
+`ITONAMI_HERMES_ROOT/installs` and adds those site-packages to the selected
+Python's import path. It does not download or copy packages. Direct CLI runs
+still require Hy in the selected interpreter or an explicit `KOTOBA_HY_DEPS`
+path (multiple paths may be separated with the platform path separator).
 
 ## Peer-to-peer execution
 

@@ -16,6 +16,10 @@
   {"kotoba"     {"base_url" "https://api.kotoba.cloud/v1"   "key_env" "KOTOBA_API_TOKEN"}
    "murakumo"   {"base_url" "https://api.murakumo.cloud/v1" "key_env" "MURAKUMO_API_TOKEN"}
    "openrouter" {"base_url" "https://openrouter.ai/api/v1"  "key_env" "OPENROUTER_API_KEY"}
+   ;; Hermes cron jobs may pin the same relay under this free-tier selector.
+   ;; It resolves to the same endpoint; Kotoba profiles' deny-host policy then
+   ;; removes the relay and appends the local P2P rail.
+   "openrouter-free" {"base_url" "https://openrouter.ai/api/v1" "key_env" "OPENROUTER_API_KEY"}
    "nous"       {"base_url" "https://inference-api.nousresearch.com/v1" "key_env" "NOUS_API_KEY"}
    "openai"     {"base_url" "https://api.openai.com/v1"     "key_env" "OPENAI_API_KEY"}
    ;; this node's own peer server: own rails, then trusted peers' rails

@@ -133,8 +133,9 @@
       (deny :private-address (str "web: non-public address " host)))))
 
 (defn- get-once
-  "One GET, no redirect following. Resolves {:status :location :text}."
-  [^js u public-override]
+  "One GET, no redirect following. Resolves bounded bytes and decoded text."
+  ([^js u public-override] (get-once u public-override max-bytes))
+  ([^js u public-override max-body-bytes]
   (p/create
    (fn [resolve reject]
      (let [mod (if (= "https:" (.-protocol u)) https http)
@@ -151,17 +152,25 @@
                     location (aget (.-headers res) "location")]
                 (if (and (<= 300 status 399) location)
                   (do (.resume res) (resolve {:status status :location location}))
-                  (let [chunks #js [] n (atom 0)]
+                  (let [chunks #js [] n (atom 0)
+                        content-type (aget (.-headers res) "content-type")]
                     (.on res "data" (fn [c]
-                                      (when (<= @n max-bytes) (.push chunks c))
-                                      (swap! n + (.-length c))
-                                      (when (> @n max-bytes) (.destroy res))))
-                    (let [done (fn [] (resolve {:status status
-                                                :truncated? (> @n max-bytes)
-                                                :text (.toString (js/Buffer.concat chunks) "utf8")}))]
+                                      (let [remaining (max 0 (- max-body-bytes @n))
+                                            take-n (min remaining (.-length c))]
+                                        (when (pos? take-n) (.push chunks (.subarray c 0 take-n)))
+                                        (swap! n + (.-length c))
+                                        (when (> @n max-body-bytes) (.destroy res)))))
+                    (let [done? (atom false)
+                          done (fn []
+                                 (when-not @done?
+                                   (reset! done? true)
+                                   (let [bytes (js/Buffer.concat chunks)]
+                                     (resolve {:status status :content-type content-type
+                                               :truncated? (> @n max-body-bytes)
+                                               :bytes bytes :text (.toString bytes "utf8")}))))]
                       (.on res "end" done)
                       (.on res "close" done)))))))
-       (.end req)))))
+       (.end req))))))
 
 (defn fetch-text
   "GET `url` within the boundary. Resolves {:status :text :url final-url
@@ -177,6 +186,23 @@
         (if-let [refusal (check-url u allow public-override)]
           (p/rejected refusal)
           (p/let [r (get-once u public-override)]
+            (if-let [loc (:location r)]
+              (p/recur (str (js/URL. loc u)) (inc hops))
+              (assoc r :url url :redirects hops))))))))
+
+(defn fetch-bytes
+  "GET public http(s) content as a byte buffer under the same SSRF and
+  redirect checks as fetch-text. The response is capped at max-bytes."
+  [url {:keys [max-bytes allow public-override] :or {max-bytes (* 25 1024 1024) public-override #{}}}]
+  (p/loop [url url hops 0]
+    (let [u (try (js/URL. url) (catch :default _ nil))]
+      (cond
+        (nil? u) (p/rejected (deny :bad-url (str "web: not a URL: " url)))
+        (> hops max-redirects) (p/rejected (deny :too-many-redirects "web: too many redirects"))
+        :else
+        (if-let [refusal (check-url u allow public-override)]
+          (p/rejected refusal)
+          (p/let [r (get-once u public-override max-bytes)]
             (if-let [loc (:location r)]
               (p/recur (str (js/URL. loc u)) (inc hops))
               (assoc r :url url :redirects hops))))))))

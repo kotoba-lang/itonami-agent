@@ -1,0 +1,312 @@
+(ns itonami.agent.browser
+  "Per-profile HTTP CONNECT proxy for browser sessions. Every browser request,
+  including redirects and subresources, resolves through this proxy. Private,
+  loopback, link-local, metadata, and allowlist-denied destinations fail closed."
+  (:require [clojure.string :as str]
+            [promesa.core :as p]
+            [itonami.agent.webguard :as webguard]
+            ["node:fs" :as fs]
+            ["node:dns" :as dns]
+            ["node:http" :as http]
+            ["node:net" :as net]
+            ["node:child_process" :as child-process]
+            [itonami.agent.host :as h]))
+
+(defonce ^:private proxies (atom {}))
+(def ^:private secret-url-pattern
+  #"(?i)(?:sk-[A-Za-z0-9_-]{10,}|ghp_[A-Za-z0-9]{10,}|github_pat_[A-Za-z0-9_]{10,}|gho_[A-Za-z0-9]{10,}|ghu_[A-Za-z0-9]{10,}|ghs_[A-Za-z0-9]{10,}|ghr_[A-Za-z0-9]{10,}|xapp-[0-9]+-[A-Za-z0-9-]{10,}|xox[baprs]-[A-Za-z0-9-]{10,}|AIza[A-Za-z0-9_-]{30,}|AKIA[A-Z0-9]{16}|sk_live_[A-Za-z0-9]{10,}|sk_test_[A-Za-z0-9]{10,})")
+
+(defn cli-available?
+  "Whether the same agent-browser executable used by run-cli is on Kotoba's PATH.
+  This is a read-only check: it never installs or launches the browser."
+  []
+  (let [separator (if (= "win32" (.-platform js/process)) #";" #":")
+        dirs (str/split (or (h/env "PATH") "") separator)
+        names (if (= "win32" (.-platform js/process)) ["agent-browser.cmd" "agent-browser"] ["agent-browser"])]
+    (boolean
+     (some (fn [dir]
+             (some (fn [name]
+                     (let [candidate (h/join dir name)]
+                       (and (h/file? candidate)
+                            (or (= "win32" (.-platform js/process))
+                                (try (.accessSync fs candidate 1) true
+                                     (catch :default _ false))))))
+                   names))
+           dirs))))
+
+(defn- secret-url? [url]
+  (or (re-find secret-url-pattern url)
+      (try (re-find secret-url-pattern (js/decodeURIComponent url))
+           (catch :default _ false))))
+
+(defn- response! [res status body]
+  (.writeHead res status #js {"content-type" "text/plain; charset=utf-8"
+                              "cache-control" "no-store"})
+  (.end res body))
+
+(defn- allowed-host? [allow host]
+  (let [host (-> (str host) (str/replace #"^\[|\]$" "") str/lower-case)]
+    (and (webguard/host-allowed? allow host)
+         (not (contains? #{"metadata.google.internal" "metadata.goog"} host)))))
+
+(defn- resolve-public
+  "Resolve once, reject if any answer is non-public, and return one pinned IP.
+  The CONNECT/HTTP handler connects to this address rather than resolving the
+  name a second time, closing the DNS-rebinding gap."
+  [host allow]
+  (let [ip (str/replace host #"^\[|\]$" "")]
+    (cond
+      (not (allowed-host? allow ip)) (p/rejected (ex-info "browser proxy: host is not allowed" {:denied :allowlist}))
+      (pos? (net/isIP ip))
+      (if (webguard/blocked-address? ip)
+        (p/rejected (ex-info "browser proxy: non-public address is blocked" {:denied :private-address}))
+        (p/resolved ip))
+      :else
+      (p/create (fn [resolve reject]
+                  (.lookup dns ip #js {:all true :verbatim true}
+                           (fn [error answers]
+                             (cond
+                               error (reject error)
+                               (or (nil? answers) (zero? (.-length answers)))
+                               (reject (ex-info "browser proxy: host did not resolve" {:denied :dns}))
+                               :else
+                               (let [rows (js->clj answers :keywordize-keys true)
+                                     blocked (some #(webguard/blocked-address? (:address %)) rows)]
+                                 (if blocked
+                                   (reject (ex-info "browser proxy: DNS returned a non-public address" {:denied :private-address}))
+                                   (resolve (:address (first rows)))))))))))))
+
+(defn- proxy-http! [allow req res]
+  (let [target (try (js/URL. (.-url req)) (catch :default _ nil))]
+    (cond
+      (nil? target) (response! res 400 "invalid proxy request URL")
+      (not (#{"http:"} (.-protocol target))) (response! res 400 "only HTTP proxy requests are supported")
+      (or (seq (.-username target)) (seq (.-password target))) (response! res 400 "URL credentials are blocked")
+      (not (allowed-host? allow (.-hostname target))) (response! res 403 "host is not allowed")
+      :else
+      (-> (resolve-public (.-hostname target) allow)
+          (p/then (fn [address]
+                    (let [headers (js/Object.assign #js {} (.-headers req))
+                          _ (js-delete headers "proxy-authorization")
+                          _ (js-delete headers "proxy-connection")
+                          _ (aset headers "host" (.-host target))
+                          opts #js {:protocol "http:" :hostname address
+                                    :port (if (.-port target) (js/parseInt (.-port target) 10) 80)
+                                    :method (.-method req)
+                                    :path (str (.-pathname target) (.-search target))
+                                    :headers headers :agent false}
+                          upstream (.request http opts (fn [reply]
+                                                         (.writeHead res (.-statusCode reply) (.-headers reply))
+                                                         (.pipe reply res)))]
+                      (.on upstream "error" (fn [_] (when-not (.-headersSent res)
+                                                       (response! res 502 "upstream request failed"))))
+                      (.on upstream "timeout" (fn [] (.destroy upstream (js/Error. "upstream timeout"))))
+                      (.pipe req upstream))))
+          (p/catch (fn [_] (when-not (.-headersSent res)
+                             (response! res 403 "destination refused by browser network policy"))))))))
+
+(defn- proxy-connect! [allow req client head]
+  (let [raw (str (.-url req))
+        match (re-matches #"^\[([^\]]+)\]:(\d+)$" raw)
+        ipv6? (some? match)
+        host (if ipv6? (nth match 1) (first (str/split raw #":")))
+        port (js/parseInt (if ipv6? (nth match 2) (second (str/split raw #":"))) 10)]
+    (if (or (str/blank? host) (not (number? port)) (not (<= 1 port 65535))
+            (not (allowed-host? allow host)))
+      (do (.write client "HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n") (.destroy client))
+      (-> (resolve-public host allow)
+          (p/then (fn [address]
+                    (let [upstream (.connect net #js {:host address :port port})]
+                      (.setTimeout upstream 20000)
+                      (.on upstream "connect"
+                           (fn []
+                             (.write client "HTTP/1.1 200 Connection Established\r\n\r\n")
+                             (when (and head (pos? (.-length head))) (.write upstream head))
+                             (.pipe upstream client)
+                             (.pipe client upstream)))
+                      (.on upstream "error" (fn [_] (.destroy client)))
+                      (.on upstream "timeout" (fn [] (.destroy upstream) (.destroy client)))
+                      (.on client "error" (fn [] (.destroy upstream)))
+                      (.on client "close" (fn [] (.destroy upstream))))))
+          (p/catch (fn [_]
+                     (try (.write client "HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n")
+                          (finally (.destroy client)))))))))
+
+(defn- local-proxy
+  "Return a live loopback proxy URL scoped to a tool-run session and web
+  allowlist so concurrent profiles cannot broaden each other's access."
+  [allow session]
+  (let [key (str session "\n" (str/join "\n" (sort (or allow []))))]
+    (if-let [ready (get @proxies key)]
+      (p/resolved (:url ready))
+      (p/create
+       (fn [resolve reject]
+         (let [server (.createServer http (fn [req res] (proxy-http! allow req res)))]
+           (.on server "connect" (fn [req client head] (proxy-connect! allow req client head)))
+           (.on server "clientError" (fn [_ socket]
+                                       (try (.write socket "HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n")
+                                            (finally (.destroy socket)))))
+           (.once server "error" reject)
+           (.listen server 0 "127.0.0.1"
+                    (fn []
+                      (.removeAllListeners server "error")
+                      (.unref server)
+                      (let [port (.-port (.address server))
+                            url (str "http://127.0.0.1:" port)]
+                        (swap! proxies assoc key {:url url :server server})
+                        (resolve url))))))))))
+
+(defn- scrub-output [s]
+  (-> (str s)
+      (str/replace secret-url-pattern "[REDACTED]")
+      (str/replace #"(?i)([?&](?:access_token|refresh_token|id_token|api[_-]?key|auth_token|client_secret|password|secret)=)[^&#\s]+" "$1[REDACTED]")
+      (str/replace #"(?i)((?:proxy-)?authorization:\s*(?:bearer|basic)\s+)[^\s\"']+" "$1[REDACTED]")
+      (str/replace #"(?i)((?:api[_-]?key|access[_-]?token|refresh[_-]?token|auth_token|client_secret|password|secret)\s*[:=]\s*)[^\s,;\"']+" "$1[REDACTED]")))
+
+(defn- cli-result [stdout stderr exit]
+  (let [s (str/trim (scrub-output stdout))
+        stderr (scrub-output stderr)]
+    (if (str/blank? s)
+      (h/json-str {"success" false "error" (if (str/blank? stderr)
+                                                 (str "agent-browser exited with status " exit)
+                                                 (subs stderr 0 (min 4000 (count stderr))))})
+      (try
+        (h/json-str (h/json-parse s))
+        (catch :default _
+          (h/json-str {"success" (zero? exit)
+                       "output" (subs s 0 (min 20000 (count s)))
+                       "error" (when-not (zero? exit) (subs stderr 0 (min 4000 (count stderr))))}))))))
+
+(defn- run-cli [ctx command args]
+  (let [allow (:web-allow (or (:terminal-policy ctx) {}))
+        browser-config (:browser-config ctx {})
+        backend (or (get browser-config "backend") "local")
+        provider (get browser-config "cloud_provider")
+        cdp (or (get browser-config "cdp_url") (get browser-config "cdp_endpoint"))
+        engine (get browser-config "engine")]
+    (if (or (not= backend "local") provider cdp (and engine (not (contains? #{"auto" "chrome"} engine))))
+      (p/resolved (h/json-str {"success" false
+                               "error" "Kotoba browser currently supports local Chrome only; configured browser backend is not compatible"}))
+      (let [session (or (:browser-session ctx) (str "kotoba-" (h/random-hex 8)))
+            _ (when-let [used (:browser-used? ctx)] (reset! used true))]
+        (-> (local-proxy allow session)
+            (p/then
+             (fn [proxy]
+               (p/create
+                (fn [resolve _reject]
+                  (let [config-dir (h/join (:home ctx) "data" "browser")
+                        config-path (h/join config-dir "agent-browser-kotoba.json")
+                        _ (h/mkdirs config-dir)
+                        _ (h/spit config-path (h/json-str {"proxy" proxy}) {:mode 384})
+                        argv (vec (concat ["--config" config-path "--session" session
+                                           "--proxy" proxy "--no-auto-dialog"
+                                           "--args" "--proxy-bypass-list=<-loopback>"]
+                                          (when (seq allow) ["--allowed-domains" (str/join "," allow)])
+                                          (when (true? (get browser-config "headed")) ["--headed"])
+                                          ["--json" command] args))
+                        safe-env (clj->js (cond-> {"PATH" (h/env "PATH")
+                                                   "HOME" (h/env "HOME")
+                                                   "TMPDIR" (h/env "TMPDIR")
+                                                   "AGENT_BROWSER_PROXY" proxy
+                                                   "AGENT_BROWSER_SESSION" session}
+                                            (h/env "LANG") (assoc "LANG" (h/env "LANG"))))
+                        child (try (.spawn child-process "agent-browser" (clj->js argv)
+                                           #js {:cwd (:home ctx) :env safe-env
+                                                :stdio #js ["ignore" "pipe" "pipe"]})
+                                   (catch :default e e))]
+                    (if (instance? js/Error child)
+                      (resolve (h/json-str {"success" false "error" (str "agent-browser unavailable: " (.-message child))}))
+                      (let [out (atom "") err (atom "") settled (atom false) timer (atom nil)
+                            finish (fn [code]
+                                     (when (compare-and-set! settled false true)
+                                       (js/clearTimeout @timer)
+                                       (resolve (cli-result @out @err code))))
+                            _ (reset! timer (js/setTimeout (fn []
+                                                            (.kill child "SIGTERM")
+                                                            (swap! err str "agent-browser command timed out")
+                                                            (finish 124)) 60000))]
+                        (.on (.-stdout child) "data" (fn [chunk]
+                                                        (let [s (str @out (.toString chunk "utf8"))]
+                                                          (reset! out (subs s (max 0 (- (count s) 200000)))))))
+                        (.on (.-stderr child) "data" (fn [chunk]
+                                                        (let [s (str @err (.toString chunk "utf8"))]
+                                                          (reset! err (subs s (max 0 (- (count s) 20000)))))))
+                        (.on child "error" (fn [e]
+                                              (swap! err str (.-message e))
+                                              (finish -1)))
+                        (.on child "close" (fn [code _signal] (finish (or code -1))))))))))
+            (p/catch (fn [e] (h/json-str {"success" false "error" (str "browser proxy: " (.-message e))})))))))))
+
+(defn navigate [ctx {:strs [url]}]
+  (if (or (not (string? url)) (str/blank? url))
+    (p/resolved (h/json-str {"success" false "error" "url is required"}))
+    (let [target (try (js/URL. url) (catch :default _ nil))
+          host (when target (.-hostname target))
+          allow (:web-allow (or (:terminal-policy ctx) {}))]
+      (cond
+        (nil? target) (p/resolved (h/json-str {"success" false "error" "Blocked: invalid URL."}))
+        (not (#{"http:" "https:"} (.-protocol target)))
+        (p/resolved (h/json-str {"success" false "error" "Blocked: only http and https URLs are allowed."}))
+        (or (seq (.-username target)) (seq (.-password target)))
+        (p/resolved (h/json-str {"success" false "error" "Blocked: URL credentials are not allowed."}))
+        (secret-url? url)
+        (p/resolved (h/json-str {"success" false "error" "Blocked: URL contains what appears to be an API key or token."}))
+        (not (allowed-host? allow host))
+        (p/resolved (h/json-str {"success" false "error" "Blocked: URL host is not allowed."}))
+        (and (pos? (net/isIP (str/replace host #"^\[|\]$" "")))
+             (webguard/blocked-address? host))
+        (p/resolved (h/json-str {"success" false "error" "Blocked: URL targets a private or reserved address."}))
+        :else (run-cli ctx "open" [url])))))
+
+(defn snapshot [ctx {:strs [full]}]
+  (run-cli ctx "snapshot" (cond-> [] (not full) (conj "-i"))))
+
+(defn click [ctx {:strs [ref]}]
+  (run-cli ctx "click" [(str ref)]))
+
+(defn type-text [ctx {:strs [ref text]}]
+  (run-cli ctx "fill" [(str ref) (str text)]))
+
+(defn scroll [ctx {:strs [direction]}]
+  (if (contains? #{"up" "down" "left" "right"} direction)
+    (run-cli ctx "scroll" [direction])
+    (p/resolved (h/json-str {"success" false "error" "direction must be up, down, left, or right"}))))
+
+(defn back [ctx _]
+  (run-cli ctx "back" []))
+
+(defn press [ctx {:strs [key]}]
+  (if (or (not (string? key)) (str/blank? key))
+    (p/resolved (h/json-str {"success" false "error" "key is required"}))
+    (run-cli ctx "press" [key])))
+
+(defn get-images [ctx _]
+  (run-cli ctx "eval"
+           ["JSON.stringify(Array.from(document.images).map(i => ({src:i.currentSrc || i.src, alt:i.alt || ''})))"]))
+
+(defn console-output [ctx {:strs [clear expression]}]
+  (if (and (string? expression) (not (str/blank? expression)))
+    (run-cli ctx "eval" [expression])
+    (run-cli ctx "console" (if clear ["--clear"] []))))
+
+(defn screenshot [ctx path annotate?]
+  (run-cli ctx "screenshot" (cond-> [path] annotate? (conj "--annotate"))))
+
+(defn close-session [ctx]
+  (if-not (and (:browser-used? ctx) @(:browser-used? ctx))
+    (p/resolved nil)
+    (let [allow (:web-allow (or (:terminal-policy ctx) {}))
+          session (:browser-session ctx)
+          key (str session "\n" (str/join "\n" (sort (or allow []))))
+          server (get-in @proxies [key :server])]
+      (-> (run-cli ctx "close" [])
+          (p/then (fn [_]
+                    (when server
+                      (.close server (fn [] nil))
+                      (swap! proxies dissoc key))
+                    nil))
+          (p/catch (fn [_]
+                     (when server
+                       (.close server (fn [] nil))
+                       (swap! proxies dissoc key))
+                     nil))))))

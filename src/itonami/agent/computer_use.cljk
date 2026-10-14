@@ -1,0 +1,292 @@
+(ns itonami.agent.computer-use
+  "Kotoba's scoped CUA driver client. The agent owns the model/tool loop; this
+  namespace translates reviewed computer-use actions into driver MCP calls."
+  (:require [clojure.string :as str]
+            [promesa.core :as p]
+            [itonami.agent.host :as h]
+            [itonami.agent.mcp :as mcp]
+            ["node:fs" :as fs]))
+
+(def ^:private env-allowlist
+  ["PATH" "HOME" "TMPDIR" "LANG" "LC_ALL" "XDG_CONFIG_HOME"
+   "DISPLAY" "WAYLAND_DISPLAY" "XAUTHORITY" "DBUS_SESSION_BUS_ADDRESS"
+   "CUA_DRIVER_RS_ENABLE_WAYLAND"])
+
+(defn driver-path [env]
+  (let [configured (or (get env "HERMES_CUA_DRIVER_CMD") (h/env "HERMES_CUA_DRIVER_CMD"))
+        path-value (or (get env "PATH") (h/env "PATH") "")
+        candidates (concat (when (and configured (not (str/blank? configured)))
+                             [(h/expand configured)])
+                           (map #(h/join % "cua-driver") (str/split path-value #":"))
+                           [(h/join (h/home-dir) ".local" "bin" "cua-driver")])]
+    (first (filter (fn [candidate]
+                     (and (string? candidate) (h/file? candidate)
+                          (try (.accessSync fs candidate 1) true (catch :default _ false))))
+                   candidates))))
+
+(defn cli-available? [env]
+  (boolean (driver-path env)))
+
+(defn- child-env [env]
+  (let [process-env (h/process-env)
+        selected (merge (select-keys process-env env-allowlist)
+                        (select-keys env ["PATH" "HOME" "TMPDIR" "LANG" "LC_ALL" "XDG_CONFIG_HOME"
+                                          "DISPLAY" "WAYLAND_DISPLAY" "XAUTHORITY" "DBUS_SESSION_BUS_ADDRESS"
+                                          "CUA_DRIVER_RS_ENABLE_WAYLAND"]))]
+    (assoc selected "CUA_DRIVER_RS_TELEMETRY_ENABLED" "0")))
+
+(defn- driver-call [ctx session requests]
+  (if-let [binary (driver-path (:tool-env ctx))]
+    (let [raw (mcp/stdio-call-sequence [binary "mcp"]
+                                       (child-env (:tool-env ctx))
+                                       (mapv (fn [[name arguments]] {"name" name "arguments" arguments}) requests)
+                                       60)]
+      (if-let [error (:error raw)]
+        {:error error}
+        {:results (get raw "results")}))
+    {:error "cua-driver is unavailable; install it and expose it on PATH or set HERMES_CUA_DRIVER_CMD"}))
+
+(defn- request [name session args]
+  [name (assoc (or args {}) "session" session)])
+
+(defn- content-text [result]
+  (->> (get result "content" [])
+       (keep #(when (and (= "text" (get % "type")) (string? (get % "text"))) (get % "text")))
+       (str/join "\n")))
+
+(defn- image-parts [result]
+  (->> (get result "content" [])
+       (keep (fn [part]
+               (when (and (= "image" (get part "type"))
+                          (string? (get part "data"))
+                          (<= (count (get part "data")) (* 12 1024 1024)))
+                 {"type" "image_url"
+                  "image_url" {"url" (str "data:" (or (get part "mimeType") "image/png")
+                                           ";base64," (get part "data"))}})))
+       vec))
+
+(defn- result-error [result]
+  (when (or (true? (get result "isError")) (get result "error"))
+    (or (get result "error") (content-text result) "cua-driver rejected the operation")))
+
+(defn- structured [result]
+  (let [value (get result "structuredContent")]
+    (if (map? value) value {})))
+
+(defn- error-result [message]
+  {"$kotoba_tool_text" (h/json-str {"error" message})})
+
+(defn- success-result [text images]
+  {"$kotoba_tool_text" text "$kotoba_tool_images" (vec images)})
+
+(defn- select-window [windows app pid window-id]
+  (let [visible (filter #(not (true? (get % "off_screen"))) windows)
+        exact (when (and pid window-id)
+                (filter #(and (= pid (get % "pid")) (= window-id (get % "window_id"))) visible))
+        matched (when (and app (not (str/blank? app)))
+                  (filter #(let [name (str/lower-case (str (get % "app_name")))
+                                 wanted (str/lower-case (str/trim app))]
+                             (or (= name wanted) (str/includes? name wanted) (str/includes? wanted name))) visible))]
+    (first (or (seq exact) (seq matched) (when-not app (seq visible)) []))))
+
+(defn- capture! [ctx args]
+  (let [session (:computer-session ctx)
+        mode (or (get args "mode") "som")
+        listing (driver-call ctx session
+                             [(request "start_session" session {})
+                              (request "list_windows" session {"on_screen_only" true})])]
+    (if-let [error (:error listing)]
+      (error-result error)
+      (let [[_ windows-result] (:results listing)
+            windows (get (structured windows-result) "windows")
+            target (select-window (if (vector? windows) windows [])
+                                  (get args "app") (get args "pid") (get args "window_id"))]
+        (if-not target
+          (error-result (if (seq windows) "no visible window matched the requested target" "cua-driver found no visible windows"))
+          (let [pid (get target "pid")
+                window-id (get target "window_id")
+                captured (driver-call ctx session
+                                      [(request "start_session" session {})
+                                       (request "get_window_state" session
+                                                (cond-> {"pid" pid "window_id" window-id "max_elements" 100}
+                                                  (true? (get-in ctx [:computer-config "include_hidden_elements"]))
+                                                  (assoc "include_hidden_elements" true)))])]
+            (if-let [error (:error captured)]
+              (error-result error)
+              (let [[_ state-result] (:results captured)
+                    failure (result-error state-result)
+                    state (structured state-result)
+                    text (content-text state-result)
+                    elements (get state "elements" [])
+                    session-state (:computer-state ctx)
+                    tokens (into {} (keep (fn [element]
+                                            (when (and (number? (get element "element_index"))
+                                                       (string? (get element "element_token")))
+                                              [(get element "element_index") (get element "element_token")]))
+                                          elements))
+                    _ (reset! session-state {:pid pid :window-id window-id
+                                             :app (get target "app_name") :tokens tokens})
+                    images (if (= mode "ax") [] (image-parts state-result))
+                    summary {"mode" mode "app" (get target "app_name") "window_title" (get target "title")
+                             "pid" pid "window_id" window-id "elements" elements
+                             "driver_text" text}]
+                (if failure
+                  (error-result failure)
+                  (success-result (h/json-str summary) images))))))))))
+
+(defn- list-action! [ctx action]
+  (let [session (:computer-session ctx)
+        tool (if (= action "list_apps") "list_apps" "list_windows")
+        args (if (= tool "list_windows") {"on_screen_only" true} {})
+        result (driver-call ctx session [(request "start_session" session {})
+                                         (request tool session args)])]
+    (if-let [error (:error result)]
+      (error-result error)
+      (let [[_ operation] (:results result)
+            failure (result-error operation)]
+        (if failure (error-result failure)
+            (success-result (or (content-text operation)
+                                (h/json-str (structured operation))) []))))))
+
+(defn- focus-app! [ctx args]
+  (let [session (:computer-session ctx)
+        result (driver-call ctx session
+                            [(request "start_session" session {})
+                             (request "list_windows" session {"on_screen_only" true})])]
+    (if-let [error (:error result)]
+      (error-result error)
+      (let [[_ operation] (:results result)
+            failure (result-error operation)
+            windows (get (structured operation) "windows")
+            target (when-not failure
+                     (select-window (if (vector? windows) windows []) (get args "app") nil nil))]
+        (cond
+          failure (error-result failure)
+          (not target) (error-result (str "no visible window matched app " (get args "app")))
+          :else (do
+                  (reset! (:computer-state ctx)
+                          {:pid (get target "pid") :window-id (get target "window_id")
+                           :app (get target "app_name") :tokens {}})
+                  (success-result (h/json-str {"targeted" (get target "app_name")
+                                               "pid" (get target "pid")
+                                               "window_id" (get target "window_id")}) [])))))))
+
+(defn- canon-keys [keys]
+  (let [parts (remove str/blank? (map str/trim (str/split (str/lower-case (or keys "")) #"\s*[+\-]\s*")))
+        aliases {"command" "cmd" "control" "ctrl" "alt" "option" "windows" "win" "super" "win" "meta" "win" "⌘" "cmd" "⌥" "option"}
+        modifiers #{"cmd" "shift" "option" "ctrl" "fn" "win"}
+        canonical (map #(get aliases % %) parts)
+        key (last (remove modifiers canonical))
+        mods (vec (filter modifiers canonical))]
+    {:key key :modifiers mods}))
+
+(defn- blocked-input? [action args]
+  (let [text (or (get args "text") "")
+        keys (:key (canon-keys (get args "keys")))
+        modifiers (set (:modifiers (canon-keys (get args "keys"))))]
+    (or (and (= action "type")
+             (re-find #"(?i)(curl\s+[^|]*\|\s*(?:bash|sh)|wget\s+[^|]*\|\s*bash|sudo\s+rm\s+-[rf]|rm\s+-rf\s+/\s*$|:\s*\(\)\s*\{\s*:\|:\s*&\s*\})" text))
+        (and (= action "key") keys
+             (or (and (contains? modifiers "cmd") (contains? modifiers "option") (contains? #{"escape" "esc"} keys))
+                 (and (contains? modifiers "cmd") (contains? modifiers "shift") (contains? #{"q" "delete" "backspace"} keys))
+                 (and (contains? modifiers "win") (contains? #{"l" "r"} keys))
+                 (and (contains? modifiers "ctrl") (contains? modifiers "alt") (contains? #{"delete" "del" "f4"} keys)))))))
+
+(defn- action-request [ctx action args]
+  (let [state @(:computer-state ctx)
+        session (:computer-session ctx)
+        target (select-keys state [:pid :window-id])
+        base (cond-> {"session" session}
+               (:window-id state) (assoc "window_id" (:window-id state)))
+        element (get args "element")
+        token (get-in state [:tokens element])
+        target-args (cond-> base token (assoc "element_token" token))]
+    (when-not (and (:pid state) (:window-id state))
+      (throw (ex-info "capture a target window before sending computer input" {})))
+    (case action
+      "click" ["click" (merge target-args (cond-> {"button" (or (get args "button") "left")}
+                                              (number? element) (assoc "element_index" element)
+                                              (vector? (get args "coordinate"))
+                                              (assoc "x" (first (get args "coordinate")) "y" (second (get args "coordinate"))))) ]
+      "double_click" ["double_click" (merge target-args (cond-> {}
+                                                      (number? element) (assoc "element_index" element)
+                                                      (vector? (get args "coordinate"))
+                                                      (assoc "x" (first (get args "coordinate")) "y" (second (get args "coordinate"))))) ]
+      "right_click" ["click" (merge target-args {"button" "right"} (when (number? element) {"element_index" element}))]
+      "middle_click" ["click" (merge target-args {"button" "middle"} (when (number? element) {"element_index" element}))]
+      "type" ["type_text" (assoc target-args "text" (or (get args "text") ""))]
+      "key" (let [{:keys [key modifiers]} (canon-keys (get args "keys"))]
+              (when-not key (throw (ex-info "key action requires a key name" {})))
+              (if (seq modifiers)
+                ["hotkey" (assoc target-args "keys" (conj modifiers key))]
+                ["press_key" (assoc target-args "key" key)]))
+      "scroll" ["scroll" (merge target-args {"direction" (or (get args "direction") "down")
+                                               "amount" (max 1 (min 50 (or (get args "amount") 3)))}
+                                  (when (number? element) {"element_index" element})
+                                  (when (vector? (get args "coordinate"))
+                                    {"x" (first (get args "coordinate")) "y" (second (get args "coordinate"))}))]
+      "set_value" (if (number? element)
+                    ["set_value" (assoc target-args "element_index" element "value" (get args "value"))]
+                    (throw (ex-info "set_value requires element" {})))
+      "drag" (let [source (get args "from_coordinate") destination (get args "to_coordinate")]
+               ["drag" (merge target-args
+                              (cond-> {}
+                                (and (number? (get args "from_element")) (number? (get args "to_element")))
+                                (assoc "from_element" (get args "from_element") "to_element" (get args "to_element"))
+                                (and (vector? source) (vector? destination))
+                                (assoc "from_x" (first source) "from_y" (second source)
+                                       "to_x" (first destination) "to_y" (second destination))))])
+      (throw (ex-info (str "unsupported computer-use action: " action) {})))))
+
+(defn call [ctx args]
+  (let [action (get args "action")
+        session (:computer-session ctx)
+        approval-required? (not (contains? #{"capture" "list_apps" "list_windows" "wait"} action))]
+    (cond
+      (and approval-required? (not (:approval-available? ctx)))
+      (error-result "computer_use requires an interactive approval channel; unattended runs cannot access the desktop")
+      (and approval-required? (not (:tool-approved? ctx)))
+      (error-result "computer_use was not approved")
+      (not (string? action)) (error-result "computer_use requires an action")
+      (contains? #{"list_apps" "list_windows"} action) (list-action! ctx action)
+      (= action "focus_app") (focus-app! ctx args)
+      (= action "capture") (capture! ctx args)
+      (= action "wait") (p/then (p/delay (* 1000 (max 0 (min 30 (or (get args "seconds") 1)))))
+                                  (fn [_] (success-result "wait complete" [])))
+      (contains? #{"click" "double_click" "right_click" "middle_click" "drag" "scroll" "type" "key" "set_value"} action)
+      (if (blocked-input? action args)
+        (error-result "computer_use hard-blocked this destructive key combination or shell pattern")
+        (try
+          (let [[tool arguments] (action-request ctx action args)
+                result (driver-call ctx session
+                                    [(request "start_session" session {})
+                                     (request tool session arguments)])]
+            (if-let [error (:error result)] (error-result error)
+              (let [[_ operation] (:results result)
+                    failure (result-error operation)]
+                (if failure (error-result failure)
+                    (success-result (or (content-text operation) (h/json-str (structured operation)))
+                                    (image-parts operation))))))
+          (catch :default e (error-result (.-message e)))))
+      :else (error-result (str "unsupported computer-use action: " action)))))
+
+(defn schema []
+  {"type" "function"
+   "function" {"name" "computer_use"
+               "description" "Capture the visible desktop and perform approved UI actions. Capture before input; input requires an interactive one-time approval."
+               "parameters" {"type" "object" "properties"
+                              {"action" {"type" "string" "enum" ["capture" "list_apps" "list_windows" "focus_app" "click" "double_click" "right_click" "middle_click" "drag" "scroll" "type" "key" "set_value" "wait"]}
+                              "mode" {"type" "string" "enum" ["som" "vision" "ax"]}
+                              "app" {"type" "string"}
+                              "pid" {"type" "integer"}
+                              "window_id" {"type" "integer"}
+                              "element" {"type" "integer"}
+                              "coordinate" {"type" "array" "items" {"type" "integer"}}
+                              "button" {"type" "string" "enum" ["left" "right" "middle"]}
+                              "from_element" {"type" "integer"} "to_element" {"type" "integer"}
+                              "from_coordinate" {"type" "array" "items" {"type" "integer"}}
+                              "to_coordinate" {"type" "array" "items" {"type" "integer"}}
+                              "direction" {"type" "string" "enum" ["up" "down" "left" "right"]}
+                              "amount" {"type" "integer"} "text" {"type" "string"} "keys" {"type" "string"}
+                              "value" {"type" "string"} "seconds" {"type" "number"}}
+                             "required" ["action"]}}})

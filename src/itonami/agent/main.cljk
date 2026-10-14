@@ -4,20 +4,27 @@
   Hermes-compatible surface (same profile homes, same files):
     itonami-agent [-p P] -z PROMPT [-m MODEL] [--provider P] [-t toolsets]
     itonami-agent [-p P] chat
-    itonami-agent [-p P] cron list | create <schedule> [prompt] [--name n --script s --deliver d]
+    itonami-agent bridge < request.json   one JSON request in; JSONL events/result out
+    itonami-agent [-p P] cron list | create <schedule> [prompt] [--name n --script s --no-agent]
+                              [--monitor-script s --monitor-url u --deliver d]
                               | run <id> | tick [--force] | runs [--limit n] | status
+                              | incidents [ack <id>]
     itonami-agent profile list | show <p>
 
   itonami layer:
     itonami-agent profile itonamify <p>|--all [--dry-run]   write itonami.edn (additive)
+    itonami-agent profile readiness <p>|--all              audit Kotoba cron compatibility
+    itonami-agent profile adopt <p>|--all|--ready-only [--dry-run] itonami ticks selected cron; Hermes stops
+    itonami-agent profile hy-stage <p>|--all <artifact-dir> [--dry-run] copy verified sibling .hy sources into profile scripts/
+    itonami-agent profile hy-migrate <p>|--all [--dry-run]  switch eligible Kotoba-owned script refs to sibling .hy files
+    itonami-agent profile release <p>|--all [--dry-run]     hand selected cron back to Hermes
     itonami-agent profile rail <p>|--all --to R [--dry-run] inference rail: murakumo | kotoba | itonami-p2p
     itonami-agent profile check <p>|--all [--summary]       validate itonami.edn and report drift (read-only)
     itonami-agent profile refresh <p>|--all [--dry-run]     recompute the bundle CID
     itonami-agent profile organize <p>|--all --registry F [--dry-run]
                                                             place profiles in the organisation (schema v2)
-    itonami-agent profile adopt <p>                         itonami ticks this profile's cron; Hermes stops
-    itonami-agent profile release <p>                       hand cron back to Hermes
     itonami-agent profile bundle <p>                        print the bundle CID and file list
+    itonami-agent profile refresh-bundle <p>                recompute CID after profile files change
     itonami-agent gateway run [--interval 60]               tick every adopted profile (resident)
     itonami-agent peer id | serve [--port 7420 --url U --max-runs 2]
                        | add <url> [--did D --trust] | trust <did> | list
@@ -33,11 +40,17 @@
             [itonami.agent.profile :as profile]
             [itonami.agent.manifest :as manifest]
             [itonami.agent.loop :as agent-loop]
+            [itonami.agent.tools :as tools]
+            [itonami.agent.browser :as browser]
+            [itonami.agent.computer-use :as computer-use]
             [itonami.agent.cron :as cron]
+            [itonami.agent.mcp :as mcp]
+            [itonami.agent.execution-ledger :as execution-ledger]
             [itonami.agent.p2p :as p2p]
             [itonami.agent.rails :as rails]
             [itonami.agent.provider :as provider]
-            ["node:readline" :as readline]))
+            ["node:readline" :as readline]
+            ["node:crypto" :as crypto]))
 
 (defn- parse-args
   "Hermes-style: -p/--profile anywhere, flags with values, the rest positional."
@@ -67,16 +80,105 @@
     (println (str "[itonami-agent] " (name (:event e)) " "
                   (pr-str (dissoc e :event :content))))))
 
-(defn- run-opts [opts]
+(defn- run-opts [opts prof]
   (cond-> {:model (:model opts) :provider (:provider opts) :pinned? (boolean (:model opts))
-           :toolsets (:toolsets opts) :platform "cli" :load-context? true :cwd (js/process.cwd)}
+           :toolsets (:toolsets opts) :platform "cli" :load-context? true :cwd (js/process.cwd)
+           :tool-overrides {"cronjob_manage" (fn [_ args] (cron/manage prof args))}}
     (:verbose opts) (assoc :on-event log-event)))
+
+(defn bridge
+  "JSONL local-host protocol. First line is the request; later approval lines
+  resolve tool calls before execution. Unsupported tools fail closed."
+  []
+  (let [rl (readline/createInterface #js {:input js/process.stdin :crlfDelay js/Infinity})
+        started? (atom false)
+        pending (atom {})]
+    (defn send-row [row] (println (h/json-str row)))
+    (defn start-request [request]
+      (let [profile-name (or (get request "profile") "default")
+            prompt (get request "prompt")
+            requested-tools (get request "tool_names")
+            unsupported (tools/unsupported-tools requested-tools)]
+        (when-not (string? prompt)
+          (throw (ex-info "bridge request requires a string prompt" {})))
+        (when-not (vector? requested-tools)
+          (throw (ex-info "bridge request requires an explicit tool_names array" {})))
+        (when (seq unsupported)
+          (throw (ex-info (str "Kotoba agent does not implement requested tools: "
+                               (str/join ", " unsupported))
+                          {:unsupported-tools unsupported})))
+        (let [prof (profile/load-profile profile-name)
+              ask-before-tool (fn [{:keys [name arguments]}]
+                                (let [request-id (.randomUUID crypto)]
+                                  (js/Promise.
+                                   (fn [resolve]
+                                     (swap! pending assoc request-id resolve)
+                                     (send-row {"type" "approval.request"
+                                                "request_id" request-id
+                                                "choices" ["once" "deny"]
+                                                "tool" name "arguments" arguments
+                                                "description" (str "Allow Kotoba agent to run " name "?")})))))
+              options {:model (get request "model")
+                       :provider (get request "provider")
+                       :pinned? (boolean (get request "model"))
+                       :tool-names requested-tools
+                       :history (get request "history")
+                       :instructions (get request "instructions")
+                       :cwd (or (get request "cwd") (js/process.cwd))
+                       :platform "api_server"
+                       :load-context? true
+                       :max-turns (get request "max_turns")
+                       :budget-s (get request "budget_s")
+                       :before-tool ask-before-tool
+                       :tool-overrides {"cronjob_manage" (fn [_ args] (cron/manage prof args))}
+                       :on-event (fn [event]
+                                   (send-row {"type" "event" "event" event}))}]
+          (-> (agent-loop/run prof prompt options)
+              (p/then (fn [result]
+                        (let [usage (:usage result)]
+                          (send-row
+                           {"type" "result"
+                            "result" {"final_response" (:final result)
+                                      "completed" (= "completed" (:exit-reason result))
+                                      "exit_reason" (:exit-reason result)
+                                      "error" (or (get-in result [:error :error])
+                                                  (when-not (= "completed" (:exit-reason result))
+                                                    (:exit-reason result)))
+                                      "usage" {"input_tokens" (or (get usage "prompt_tokens") 0)
+                                               "output_tokens" (or (get usage "completion_tokens") 0)
+                                               "total_tokens" (or (get usage "total_tokens") 0)}
+                                      "model" (:model result)
+                                      "provider" (:provider result)}})))
+              (p/catch (fn [e]
+                         (send-row {"type" "error" "error" (.-message e)})
+                         (set! (.-exitCode js/process) 1)))
+              (p/finally (fn [] (.close rl))))))))
+    (.on rl "line"
+         (fn [line]
+           (try
+             (let [message (h/json-parse line)]
+               (if-not @started?
+                 (do
+                   (reset! started? true)
+                   (start-request message))
+                 (let [request-id (get message "request_id")
+                       choice (get message "choice")
+                       resolve (get @pending request-id)]
+                   (when (and (= (get message "type") "approval")
+                              (contains? #{"once" "deny"} choice) resolve)
+                     (swap! pending dissoc request-id)
+                     (resolve (= choice "once"))))))
+             (catch :default e
+               (send-row {"type" "error" "error" (.-message e)})
+               (set! (.-exitCode js/process) 1)
+               (.close rl)))))
+    nil))
 
 ;; ---------------------------------------------------------------- -z / chat
 
 (defn oneshot [opts]
   (p/let [prof (profile/load-profile (:profile opts))
-          r ((executor opts) prof (:oneshot opts) (run-opts opts))]
+          r ((executor opts) prof (:oneshot opts) (run-opts opts prof))]
     (if (and (= "completed" (:exit-reason r)) (not (str/blank? (:final r))))
       (do (println (:final r))
           (when (:verbose opts)
@@ -89,7 +191,18 @@
 (defn chat [opts]
   (let [prof (profile/load-profile (:profile opts))
         rl (readline/createInterface #js {:input js/process.stdin :output js/process.stdout})
-        history (atom nil)]
+        history (atom nil)
+        ask-before-tool (fn [{:keys [name arguments]}]
+                          (let [arguments (if (map? arguments) arguments
+                                            (try (h/json-parse (str arguments)) (catch :default _ {})))]
+                          (if (and (= name "computer_use")
+                                   (not (contains? #{"capture" "list_apps" "list_windows" "wait"}
+                                                   (get arguments "action"))))
+                            (js/Promise.
+                             (fn [resolve]
+                               (.question rl (str "Approve computer_use " (get arguments "action") "? [y/N] ")
+                                  (fn [answer] (resolve (= "y" (str/lower-case (str/trim answer))))))))
+                            true)))]
     (println (str "itonami-agent · profile " (:name prof) " · /exit to quit"))
     (letfn [(ask []
               (.question rl "> "
@@ -99,7 +212,8 @@
                              (let [prompt (if @history
                                             (str "Conversation so far:\n" @history "\n\nUser: " line)
                                             line)]
-                               (-> ((executor opts) prof prompt (run-opts opts))
+                               (-> ((executor opts) prof prompt
+                                    (assoc (run-opts opts prof) :before-tool ask-before-tool))
                                    (p/then (fn [r]
                                              (println (or (:final r) (str "[" (:exit-reason r) "] " (get-in r [:error :error]))))
                                              (swap! history #(str % "\nUser: " line "\nAssistant: " (:final r)))
@@ -133,7 +247,14 @@
 
       ("create" "add")
       (let [[schedule prompt] args
+            no-agent (boolean (:no-agent opts))
+            _ (when (or (str/blank? (str schedule))
+                        (and no-agent (str/blank? (str (:script opts))))
+                        (and (not no-agent) (str/blank? (str prompt))))
+                (die 2 "create requires a schedule and either a prompt or --no-agent with --script"))
             j (cron/new-job {:schedule schedule :prompt prompt :name (:name opts) :script (:script opts)
+                             :monitor-script (:monitor-script opts) :monitor-url (:monitor-url opts)
+                             :no-agent no-agent
                              :deliver (:deliver opts) :model (:model opts) :provider (:provider opts)
                              :toolsets (:toolsets opts) :workdir (:workdir opts)})]
         (cron/write-jobs! home (conj (cron/read-jobs home) j))
@@ -155,11 +276,29 @@
 
       ("runs" "history")
       (let [f (h/join home "cron" "itonami-runs.jsonl")
-            rows (if (h/file? f) (map h/json-parse (remove str/blank? (str/split-lines (h/slurp f)))) [])]
-        (doseq [r (take-last (js/parseInt (or (:limit opts) "20") 10) rows)]
-          (println (str (.padEnd (str (get r "status")) 9) "  job=" (get r "job_id") "  " (get r "ts")
-                        "  " (get r "provider") "/" (get r "model")
-                        (when (get r "peer") (str "  peer=" (get r "peer")))))))
+            details (if (h/file? f) (map h/json-parse (remove str/blank? (str/split-lines (h/slurp f)))) [])
+            details-by-id (into {} (keep (fn [r] (when-let [id (get r "execution_id")] [id r])) details))
+            rows (execution-ledger/rows home nil)]
+        (doseq [r (take-last (js/parseInt (or (:limit opts) "20") 10) rows)
+                :let [detail (details-by-id (get r "id"))]]
+          (println (str (.padEnd (str (get r "status")) 9) "  job=" (get r "job_id") "  " (get r "claimed_at")
+                        "  id=" (get r "id") "  source=" (get r "source")
+                        (when (get r "delivery_outcome") (str "  delivery=" (get r "delivery_outcome")))
+                        (when detail (str "  " (get detail "provider") "/" (get detail "model")))
+                        (when (and detail (get detail "peer") (str "  peer=" (get detail "peer"))))))))
+
+      "incidents"
+      (let [[action incident-id] args]
+        (if (= action "ack")
+          (if (execution-ledger/ack-incident! home incident-id)
+            (println (str "closed incident " incident-id))
+            (die 2 (str "no such incident: " incident-id)))
+          (doseq [r (execution-ledger/incidents home)]
+            (println (str (.padEnd (str (get r "state")) 9)
+                          " job=" (get r "job_id")
+                          " type=" (get r "failure_type")
+                          " id=" (get r "id")
+                          " last=" (get r "last_seen_at"))))))
 
       "status"
       (let [hb (h/join home "cron" "ticker_heartbeat")]
@@ -180,6 +319,165 @@
       (h/spit f (str "parked by itonami-agent profile adopt at " (h/iso-local) "\n"))
       (h/rm f))))
 
+(defn- active-cron-job? [job]
+  (and (get job "enabled" true)
+       (not (contains? #{"paused" "completed" "disabled"} (get job "state" "scheduled")))))
+
+(defn- browser-cdp-configured? [prof]
+  (let [dotenv (profile/parse-dotenv
+                (let [path (h/join (:home prof) ".env")]
+                  (when (h/file? path) (h/slurp path))))
+        secret-command (get-in prof [:config "secrets" "command"])
+        secret-command-may-export-cdp? (and (map? secret-command)
+                                            (true? (get secret-command "enabled"))
+                                            (not (str/blank? (get secret-command "command"))))]
+    (boolean (or secret-command-may-export-cdp?
+                 (some (complement str/blank?)
+                       [(get-in prof [:config "browser" "cdp_url"])
+                        (get-in prof [:config "browser" "cdp_endpoint"])
+                        (get (:env prof) "BROWSER_CDP_URL")
+                        (get dotenv "BROWSER_CDP_URL")
+                        (h/env "BROWSER_CDP_URL")])))))
+
+(defn- kotoba-job-issues [prof job]
+  "Read-only compatibility gate for a single active Hermes cron job."
+  (let [config (:config prof)
+        requested (cron/tool-sets-for config job)
+        disabled (tools/execution-disabled-toolsets config "cron")
+        servers (get config "mcp_servers" {})
+        selected-mcp (if (true? (get job "no_agent")) [] (mcp/names-for config requested disabled))
+        oauth-unready (filter #(and (get-in servers [% "url"])
+                                    (= "oauth" (get-in servers [% "auth"]))
+                                    (not (mcp/oauth-cache-ready? (:home prof) % (get servers % {}))))
+                              selected-mcp)
+        bad-sets (if (true? (get job "no_agent")) []
+                   (tools/unsupported-toolsets requested (set (keys servers))))
+        browser-cdp (browser-cdp-configured? prof)
+        bad-tools (if (true? (get job "no_agent")) []
+                    (tools/unsupported-tools (tools/runtime-tool-names requested disabled browser-cdp
+                                                                          (browser/cli-available?)
+                                                                          (computer-use/cli-available? (:env prof)))))
+        enabled-tools (tools/runtime-tool-names requested disabled browser-cdp
+                                               (browser/cli-available?)
+                                               (computer-use/cli-available? (:env prof)))
+        browser-selected? (some (set tools/browser-tools) enabled-tools)
+        browser-config (get config "browser" {})
+        browser-backend (or (get browser-config "backend") "local")
+        browser-provider (get browser-config "cloud_provider")
+        browser-engine (get browser-config "engine")
+        lane (or (get job "deliver") "local")]
+    (concat
+     (when (and (not (true? (get job "no_agent"))) (seq bad-sets))
+       [{:code :unsupported_toolset :detail (str/join ", " bad-sets)}])
+     (when (and (not (true? (get job "no_agent"))) (seq bad-tools))
+       [{:code :unsupported_tools :detail (str/join ", " bad-tools)}])
+     (when (and browser-selected?
+                (or (not= browser-backend "local") browser-provider browser-cdp
+                    (and browser-engine (not (contains? #{"auto" "chrome"} browser-engine)))))
+       [{:code :unsupported_browser_backend :detail "Kotoba browser supports local Chrome only"}])
+     (when (seq oauth-unready)
+       [{:code :oauth_cache_unavailable :detail (str/join ", " oauth-unready)}])
+     (when (not= "local" (str/lower-case (str lane)))
+       [{:code :delivery_adapter :detail (str lane)}]))))
+
+(defn- profile-readiness-issues [prof]
+  (vec (mapcat (fn [job]
+                 (when (and (map? job) (active-cron-job? job))
+                   (map #(assoc % :job (get job "id" "(unknown)"))
+                        (concat (kotoba-job-issues prof job)
+                                (cron/script-runtime-issues prof job)))))
+               (get-in prof [:jobs "jobs"] []))))
+
+(defn- issue-summary [issues]
+  (->> issues
+       (group-by :code)
+       (map (fn [[code rows]]
+              (let [details (->> rows (keep :detail) (mapcat #(str/split % #",\s*")) distinct sort)
+                    summary (str (name code) "=" (count rows))]
+                (if (seq details) (str summary "[" (str/join "," details) "]") summary))))
+       sort
+       (str/join ", ")))
+
+(defn- hy-script-target [home rel]
+  (when (and (string? rel) (str/ends-with? rel ".py"))
+    (let [scripts (h/join home "scripts")
+          target (str (subs rel 0 (- (count rel) 3)) ".hy")
+          source (h/join scripts rel)
+          abs (h/join scripts target)
+          source-contained? (try
+                              (let [root (h/realpath scripts)
+                                    resolved (h/realpath source)
+                                    separator (if (= "win32" (.-platform js/process)) "\\" "/")]
+                                (str/starts-with? resolved (str root separator)))
+                              (catch :default _ false))]
+      (when (and (cron/script-path-safe? scripts target)
+                 source-contained?
+                 (h/file? source)
+                 (h/file? abs))
+        target))))
+
+(defn- rewrite-job-hy-refs [home jobs]
+  (let [counts (atom {"script" 0 "monitor_script" 0})
+        updated
+        (mapv (fn [job]
+                (if-not (map? job) job
+                  (reduce (fn [j field]
+                            (if-let [target (hy-script-target home (get j field))]
+                              (do (swap! counts update field inc)
+                                  (assoc j field target))
+                              j))
+                          job ["script" "monitor_script"])))
+              jobs)]
+    {:jobs updated :counts @counts}))
+
+(defn- stage-profile-hy! [name artifact-root records dry-run?]
+  (let [home (profile/home name)
+        scripts (h/join home "scripts")
+        payload-scripts (h/join artifact-root name "scripts")
+        selected (filter #(= name (get % "profile")) records)
+        plan
+        (mapv (fn [{:strs [source target source_sha256 target_sha256]}]
+                (let [target-rel (some-> target (str/replace-first #"^scripts/" ""))
+                      source-path (h/join home source)
+                      payload-path (h/join artifact-root name target)
+                      target-path (h/join home target)
+                      scripts-real (try (h/realpath scripts) (catch :default _ nil))
+                      source-real (try (h/realpath source-path) (catch :default _ nil))
+                      source-safe? (and scripts-real source-real
+                                        (str/starts-with? source-real (str scripts-real "/")))]
+                  (when-not (and (string? source) (string? target)
+                                 (str/starts-with? source "scripts/")
+                                 (str/starts-with? target "scripts/")
+                                 (str/ends-with? source ".py")
+                                 (= target (str (subs source 0 (- (count source) 3)) ".hy"))
+                                 (re-matches #"^[0-9a-f]{64}$" (str source_sha256))
+                                 (re-matches #"^[0-9a-f]{64}$" (str target_sha256))
+                                 (cron/script-path-safe? scripts target-rel)
+                                 (cron/script-path-safe? payload-scripts target-rel)
+                                 (h/file? source-path) source-safe?
+                                 (h/file? payload-path) (not (h/symlink? payload-path)))
+                    (throw (ex-info (str "invalid or missing Hy migration payload for " name ": " target) {})))
+                  (let [source-hash (h/sha256-hex (h/slurp-bytes source-path))
+                        target-hash (h/sha256-hex (h/slurp-bytes payload-path))
+                        existing-hash (when (h/file? target-path) (h/sha256-hex (h/slurp-bytes target-path)))]
+                    (when-not (= source_sha256 source-hash)
+                      (throw (ex-info (str "Python source drift for " name ": " source) {})))
+                    (when-not (= target_sha256 target-hash)
+                      (throw (ex-info (str "Hy payload hash mismatch for " name ": " target) {})))
+                    (when (and existing-hash (not= existing-hash target_sha256))
+                      (throw (ex-info (str "refusing to replace different Hy source for " name ": " target) {})))
+                    {:target target-path :content (h/slurp payload-path) :existing? (some? existing-hash)})))
+              selected)
+        missing (remove :existing? plan)
+        _ (when (and (seq plan) (not (h/dir? scripts)))
+            (throw (ex-info (str "profile scripts directory is missing: " name) {})))]
+    (when-not dry-run?
+      (doseq [{:keys [target content]} missing]
+        (h/spit-atomic target content))
+      (when (and (seq missing) (:itonami (profile/load-profile name {:secrets? false})))
+        (profile/refresh-bundle-cid home)))
+    {:files (count plan) :staged (count missing) :existing (- (count plan) (count missing))}))
+
 (defn profile-cmd [opts [sub & args]]
   (case sub
     ("list" nil)
@@ -197,6 +495,25 @@
                     "\nmodel: " (get-in prof [:config "model" "provider"]) "/" (get-in prof [:config "model" "default"])
                     "\njobs: " (count (get-in prof [:jobs "jobs"]))
                     "\nitonami: " (if (:itonami prof) (pr-str (select-keys (:itonami prof) [:runtime :placement :bundle])) "no"))))
+
+    "readiness"
+    (let [targets (if (:all opts) (profile/names) [(first args)])
+          blocked (atom 0)
+          issues-count (atom 0)]
+      (doseq [n targets]
+        (try
+          (let [prof (profile/load-profile n {:secrets? false})
+                issues (profile-readiness-issues prof)]
+            (if (seq issues)
+              (do (swap! blocked inc)
+                  (swap! issues-count + (count issues))
+                  (println (str "blocked " n "  " (issue-summary issues))))
+              (println (str "ready   " n))))
+          (catch :default e
+            (swap! blocked inc)
+            (swap! issues-count inc)
+            (println (str "error   " n "  " (.-message e))))))
+      (println (str @blocked " profile(s) blocked; " @issues-count " compatibility issue(s)")))
 
     "itonamify"
     (let [targets (if (:all opts) (profile/names) [(first args)])
@@ -301,21 +618,163 @@
       (println (profile/bundle-cid files))
       (doseq [[path sha] (profile/bundle-manifest files)] (println (str "  " (subs sha 0 12) "  " path))))
 
+    "refresh-bundle"
+    (let [prof (profile/load-profile (first args) {:secrets? false})]
+      (when-not (:itonami prof)
+        (die 2 (str "profile " (:name prof) " is not itonamified; run profile itonamify first")))
+      (let [m (profile/refresh-bundle-cid (:home prof))]
+        (println (str "refreshed " (:name prof) " bundle " (get-in m [:bundle :cid])))))
+
+    "hy-stage"
+    (let [all? (:all opts)
+          artifact-arg (if all? (if (string? all?) all? (first args)) (second args))
+          artifact-dir (h/expand artifact-arg)
+          manifest-path (h/join artifact-dir "migration.json")
+          manifest (when (h/file? manifest-path) (h/json-parse (h/slurp manifest-path)))
+          targets (if all? (profile/names) [(first args)])]
+      (when-not (= "kotoba-hermes-cron-hy-patch-v2" (get manifest "format"))
+        (die 2 (str "invalid Hy migration manifest: " manifest-path)))
+      (let [records (get manifest "script_files" [])
+            staged-total (atom 0) existing-total (atom 0) skipped (atom 0)]
+        (doseq [n targets]
+          (try
+            (let [{:keys [files staged existing]}
+                  (stage-profile-hy! n artifact-dir records (:dry-run opts))]
+              (swap! staged-total + staged)
+              (swap! existing-total + existing)
+              (println (str (if (:dry-run opts) "would  " "staged ") n
+                            "  files=" files " new=" staged " present=" existing)))
+            (catch :default e
+              (swap! skipped inc)
+              (println (str "skip    " n "  " (.-message e))))))
+        (println (str @staged-total " Hy source file(s) " (if (:dry-run opts) "would be " "")
+                      "staged; " @existing-total " already present; " @skipped " profile(s) skipped"))))
+
+    "hy-migrate"
+    (let [targets (if (:all opts) (profile/names) [(first args)])
+          converted (atom 0)
+          skipped (atom 0)]
+      (doseq [n targets]
+        (try
+          (let [prof (profile/load-profile n {:secrets? false})
+                home (:home prof)
+                scheduler (get-in prof [:itonami :runtime :scheduler])
+                parked? (h/file? (h/join home "gateway.parked"))
+                {:keys [jobs counts]} (rewrite-job-hy-refs home (cron/read-jobs home))
+                runtime-issues (mapcat #(cron/script-runtime-issues prof %)
+                                       (filter map? jobs))
+                issues (concat (profile-readiness-issues prof) runtime-issues)
+                nrefs (+ (get counts "script" 0) (get counts "monitor_script" 0))]
+            (cond
+              (or (not= :itonami scheduler) (not parked?))
+              (do (swap! skipped inc)
+                  (println (str "skip    " n "  scheduler is not Kotoba-owned")))
+              (seq issues)
+              (do (swap! skipped inc)
+                  (println (str "blocked " n "  " (issue-summary issues))))
+              (zero? nrefs)
+              (println (str "keep    " n "  no .py refs with sibling .hy files"))
+              (:dry-run opts)
+              (do (swap! converted + nrefs)
+                  (println (str "would   convert " n "  script=" (get counts "script")
+                                " monitor_script=" (get counts "monitor_script"))))
+              :else
+              (let [tick-lock (h/join home "cron" ".itonami-tick.lock")]
+                (if-not (h/acquire-lock! tick-lock)
+                  (do (swap! skipped inc)
+                      (println (str "skip    " n "  Kotoba tick is in progress")))
+                  (try
+                    (let [counts* (atom {"script" 0 "monitor_script" 0})]
+                      (cron/transform-jobs!
+                       home
+                       (fn [current]
+                         (let [{:keys [jobs counts]} (rewrite-job-hy-refs home current)
+                               runtime-issues (mapcat #(cron/script-runtime-issues prof %)
+                                                      (filter map? jobs))]
+                           (when (seq runtime-issues)
+                             (throw (ex-info (str "Hy runtime unavailable: "
+                                                  (issue-summary runtime-issues))
+                                             {:issues runtime-issues})))
+                           (reset! counts* counts)
+                           jobs)))
+                      (let [counts @counts*
+                            nrefs (+ (get counts "script" 0) (get counts "monitor_script" 0))]
+                        (if (pos? nrefs)
+                          (do
+                              ;; cron/jobs.json is part of the profile bundle. Refresh only
+                              ;; after the rewritten references have been atomically saved.
+                              (profile/refresh-bundle-cid home)
+                              (swap! converted + nrefs)
+                              (println (str "converted " n "  script=" (get counts "script")
+                                            " monitor_script=" (get counts "monitor_script"))))
+                          (println (str "keep    " n "  references already converted")))))
+                    (finally (h/release-lock! tick-lock)))))))
+          (catch :default e
+            (swap! skipped inc)
+            (println (str "error   " n "  " (.-message e))))))
+      (println (str @converted " script ref(s) " (if (:dry-run opts) "would be " "")
+                    "converted; " @skipped " profile(s) skipped")))
+
     "adopt"
-    (let [prof (profile/load-profile (first args) {:secrets? false})
-          m (or (:itonami prof) (profile/default-manifest prof))
-          m (assoc-in m [:runtime :scheduler] :itonami)]
-      (profile/write-manifest! (:home prof) m)
-      (set-hermes-parked! (:home prof) true)
-      (profile/refresh-bundle-cid (:home prof))
-      (println (str "adopted " (:name prof) ": itonami-agent ticks its cron; Hermes skips it (gateway.parked marker)")))
+    (let [targets (if (or (:all opts) (:ready-only opts)) (profile/names) [(first args)])
+          entries (mapv (fn [n]
+                          (try
+                            (let [prof (profile/load-profile n {:secrets? false})
+                                  m (or (:itonami prof) (profile/default-manifest prof))
+                                  scheduler (or (get-in m [:runtime :scheduler]) :hermes)]
+                              {:name n :profile prof :manifest m
+                               :error (when-not (contains? #{:hermes :itonami} scheduler)
+                                        (str "scheduler " (name scheduler)
+                                             " must be retired before Kotoba adoption"))
+                               :already? (and (= :itonami (get-in m [:runtime :scheduler]))
+                                              (h/file? (h/join (:home prof) "gateway.parked")))
+                               :issues (profile-readiness-issues prof)})
+                            (catch :default e {:name n :error (.-message e)})))
+                        targets)
+          blockers (filter #(or (:error %) (seq (:issues %))) entries)
+          changed (atom 0)]
+      (if (and (:all opts) (seq blockers))
+        (do
+          (doseq [{:keys [name error issues]} blockers]
+            (println (str (if error "error   " "blocked ") name "  "
+                          (or error (issue-summary issues)))))
+          (println (str "refused all-profile adoption; " (count blockers)
+                        " of " (count entries) " profiles are not Kotoba-ready; no profiles changed")))
+        (do
+          (doseq [{:keys [name profile manifest already? issues error]} entries]
+            (cond
+              error (println (str "error   " name "  " error))
+              already? (println (str "keep    " name "  already Kotoba-scheduled"))
+              (seq issues) (println (str "blocked " name "  " (issue-summary issues)))
+              (:dry-run opts) (do (swap! changed inc) (println (str "would   adopt " name)))
+              :else (let [home (:home profile)]
+                      (profile/write-manifest! home (assoc-in manifest [:runtime :scheduler] :itonami))
+                      (set-hermes-parked! home true)
+                      (profile/refresh-bundle-cid home)
+                      (swap! changed inc)
+                      (println (str "adopted " name ": Kotoba ticks cron; Hermes is parked")))))
+          (println (str @changed " profile(s) " (if (:dry-run opts) "would be " "") "adopted")))))
 
     "release"
-    (let [prof (profile/load-profile (first args) {:secrets? false})]
-      (when (:itonami prof)
-        (profile/write-manifest! (:home prof) (assoc-in (:itonami prof) [:runtime :scheduler] :hermes)))
-      (set-hermes-parked! (:home prof) false)
-      (println (str "released " (:name prof) ": Hermes ticks its cron again")))
+    (let [targets (if (:all opts) (profile/names) [(first args)])
+          changed (atom 0)]
+      (doseq [n targets]
+        (try
+          (let [prof (profile/load-profile n {:secrets? false})
+                home (:home prof)
+                owned? (or (= :itonami (get-in prof [:itonami :runtime :scheduler]))
+                           (h/file? (h/join home "gateway.parked")))]
+            (cond
+              (not owned?) (println (str "keep    " n "  already Hermes-scheduled"))
+              (:dry-run opts) (do (swap! changed inc) (println (str "would   release " n)))
+              :else (do
+                      (when (:itonami prof)
+                        (profile/write-manifest! home (assoc-in (:itonami prof) [:runtime :scheduler] :hermes)))
+                      (set-hermes-parked! home false)
+                      (swap! changed inc)
+                      (println (str "released " n ": Hermes ticks cron again")))))
+          (catch :default e (println (str "skip    " n "  " (.-message e))))))
+      (println (str @changed " profile(s) " (if (:dry-run opts) "would be " "") "released")))
 
     (die 2 (str "unknown profile command: " sub))))
 
@@ -412,6 +871,7 @@
             (and (:oneshot opts) (not= "peer" (first pos))) (oneshot opts)
             :else
             (case (first pos)
+              "bridge" (bridge)
               "chat" (chat opts)
               "cron" (cron-cmd opts (rest pos))
               "profile" (profile-cmd opts (rest pos))
